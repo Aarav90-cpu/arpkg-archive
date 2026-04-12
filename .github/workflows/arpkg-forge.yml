@@ -1,0 +1,94 @@
+name: ARK OS Package Forge
+
+# Only trigger when a PR is merged into main and modifies an ARKBUILD file
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'core/**/ARKBUILD'
+      - 'community/**/ARKBUILD'
+
+# Give the Action permission to commit the compiled files back to your repo
+permissions:
+  contents: write
+
+jobs:
+  build-and-sign:
+    name: Compile, Hash, and Release
+    runs-on: ubuntu-latest
+    # Run natively in a musl-based Alpine container
+    container: alpine:latest 
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Native musl Build Tools
+        run: |
+          apk update
+          apk add --no-cache bash build-base wget tar coreutils jq git
+
+      - name: Forge Packages and Generate Hashes
+        run: |
+          # Configure Git for the automated bot
+          git config --global user.name "ARK-OS Forge Bot"
+          git config --global user.email "forge-bot@ark-os.local"
+          git config --global --add safe.directory /__w/arpkg-archive/arpkg-archive
+
+          # Find all modified ARKBUILD files in the latest commit
+          CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD | grep 'ARKBUILD$' || true)
+
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No ARKBUILD files modified. Exiting gracefully."
+            exit 0
+          fi
+
+          for BUILD_FILE in $CHANGED_FILES; do
+            echo "=> Processing $BUILD_FILE"
+            PKG_DIR=$(dirname "$BUILD_FILE")
+            CATEGORY=$(echo "$PKG_DIR" | cut -d'/' -f1) # 'core' or 'community'
+            
+            # Source the ARKBUILD to get variables (PKG_NAME, PKG_VERSION)
+            source "$BUILD_FILE"
+            
+            # Setup isolated build roots
+            BUILD_DIR="/tmp/build-$PKG_NAME"
+            PKG_ROOT="/tmp/pkg-$PKG_NAME"
+            mkdir -p "$BUILD_DIR" "$PKG_ROOT"
+            
+            # Execute the build function defined in the ARKBUILD
+            cd "$BUILD_DIR"
+            build
+            
+            # Copy the metadata file into the final package
+            cp "$GITHUB_WORKSPACE/$PKG_DIR/pkginfo.json" "$PKG_ROOT/pkginfo.json"
+            
+            # Package the binaries
+            cd "$PKG_ROOT"
+            FINAL_ARCHIVE="$PKG_NAME-$PKG_VERSION.tar.gz"
+            tar -czf "$GITHUB_WORKSPACE/$PKG_DIR/$FINAL_ARCHIVE" .
+            
+            # Generate the SHA-256 Cryptographic Hash
+            cd "$GITHUB_WORKSPACE/$PKG_DIR"
+            HASH=$(sha256sum "$FINAL_ARCHIVE" | awk '{print $1}')
+            echo "$HASH" > "$PKG_NAME.sha256"
+            
+            echo "=> Successfully forged $FINAL_ARCHIVE with hash $HASH"
+            
+            # Update the appropriate repository index list
+            LIST_FILE="$GITHUB_WORKSPACE/$CATEGORY/$CATEGORY.list"
+            # Remove old entry if it exists, then append the new one
+            grep -v "^$PKG_NAME " "$LIST_FILE" > "$LIST_FILE.tmp" || true
+            echo "$PKG_NAME $PKG_VERSION $HASH $DEPENDENCIES" >> "$LIST_FILE.tmp"
+            mv "$LIST_FILE.tmp" "$LIST_FILE"
+            
+            # Stage the new binary, hash, and updated list for commit
+            git add "$FINAL_ARCHIVE" "$PKG_NAME.sha256" "$CATEGORY/$CATEGORY.list"
+          done
+
+          # Commit and Push the compiled assets back to the repository
+          git commit -m "Forge Bot: Automated build and cryptographic signing" || echo "Nothing to commit"
+          git push
