@@ -10,6 +10,8 @@ This is the official package repository for **arpkg**, the native package manage
 ## Requirements for Submission
 To submit a package to ARK OS, you must create a directory with your package name and include a single configuration file called `ARKBUILD`.
 
+> Note: Make sure the `ARKBUILD` does not contain wget commands!
+
 ### 1. Directory Structure
 Fork this repository and create your package under the appropriate category:
 ```text
