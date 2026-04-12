@@ -1,0 +1,50 @@
+name: ARK OS Auto-Auditor
+
+# Trigger only when someone opens or updates a Pull Request
+on:
+  pull_request:
+    paths:
+      - 'core/**'
+      - 'community/**'
+
+jobs:
+  audit:
+    name: Security and Syntax Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR Code
+        uses: actions/checkout@v4
+
+      - name: Enforce Directory Rules
+        run: |
+          # Ensure they didn't upload any pre-compiled binaries
+          if find . -name "*.tar.gz" -o -name "*.so" -o -name "*.o" | grep -q .; then
+            echo "::error::Binaries detected! ARK OS is source-only."
+            exit 1
+          fi
+
+      - name: Security Scan (ARKBUILD)
+        run: |
+          # Scan all modified ARKBUILD files for dangerous commands
+          for file in $(find . -name "ARKBUILD"); do
+            if grep -qE "sudo|rm -rf /|mkfs|dd if=" "$file"; then
+              echo "::error::Malicious commands detected in $file."
+              exit 1
+            fi
+            
+            # Ensure the source URL is HTTPS, not a sketchy HTTP or FTP server
+            if ! grep -q 'SOURCE_URL="https://' "$file"; then
+              echo "::error::SOURCE_URL must be a secure HTTPS link."
+              exit 1
+            fi
+          done
+
+      - name: Verify Metadata (pkginfo.json)
+        run: |
+          # Check if the JSON is valid
+          for file in $(find . -name "pkginfo.json"); do
+            if ! jq e . "$file" >/dev/null 2>&1; then
+              echo "::error::Invalid JSON format in $file."
+              exit 1
+            fi
+          done
