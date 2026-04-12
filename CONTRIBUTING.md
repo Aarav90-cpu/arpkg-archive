@@ -33,26 +33,20 @@ Create an `ARKBUILD` file using the following template:
 ```bash
 
 # ARKBUILD Template
-PKG_NAME="package-name"
+PKG_NAME="example"
 PKG_VERSION="1.0.0"
-# MUST point to the official developer's source code
-SOURCE_URL="[https://example.com/source/package-1.0.0.tar.gz](https://example.com/source/package-1.0.0.tar.gz)"
-DEPENDENCIES="dependency1 dependency2"
+SOURCE_URL="https://github.com/developer/example.git"
+DEPENDENCIES=""
 
-# The compilation instructions
-build() {
-    # 1. Fetch the source
-    wget $SOURCE_URL
-    tar -xzf $PKG_NAME-$PKG_VERSION.tar.gz
-    cd $PKG_NAME-$PKG_VERSION
-    
-    # 2. Configure for native musl environment
+fetch() {
+    git clone --depth 1 --branch v$PKG_VERSION $SOURCE_URL
+}
+
+compile() {
+    cd example
+    ./autogen.sh
     ./configure --prefix=/usr
-    
-    # 3. Compile
     make -j$(nproc)
-    
-    # 4. Install to the temporary packaging root
     make DESTDIR=$PKG_ROOT install
 }
 
