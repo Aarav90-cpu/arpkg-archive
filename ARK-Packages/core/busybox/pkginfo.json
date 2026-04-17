@@ -1,0 +1,10 @@
+{
+  "pkg_name": "busybox",
+  "maintainer": "ARK OS Core Team",
+  "email": "noreply@github.com",
+  "credits": [
+    "Original Author: Denys Vlasenko and the BusyBox project",
+    "Ported by: ARK OS Core Team"
+  ],
+  "support_url": "https://github.com/Aarav90-cpu/arpkg-archive/issues"
+}

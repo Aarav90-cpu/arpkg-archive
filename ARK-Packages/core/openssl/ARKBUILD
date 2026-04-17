@@ -1,0 +1,20 @@
+# ARKBUILD — openssl
+# TLS/crypto library required by curl-musl, rclone, and the arpkg client
+PKG_NAME="openssl"
+PKG_VERSION="3.3.1"
+SOURCE_URL="https://github.com/openssl/openssl.git"
+DEPENDENCIES="musl"
+
+build() {
+    git clone --depth 1 --branch "openssl-$PKG_VERSION" "$SOURCE_URL" openssl
+    cd openssl
+    ./Configure \
+        linux-x86_64 \
+        --prefix=/usr \
+        --openssldir=/etc/ssl \
+        no-shared \
+        no-tests \
+        -Os -pipe
+    make -j$(nproc)
+    make DESTDIR="$PKG_ROOT" install_sw install_ssldirs
+}

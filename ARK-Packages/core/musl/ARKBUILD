@@ -1,0 +1,18 @@
+# ARKBUILD — musl
+# The musl libc — foundation of the entire ARK OS userland
+PKG_NAME="musl"
+PKG_VERSION="1.2.5"
+SOURCE_URL="https://git.musl-libc.org/git/musl"
+DEPENDENCIES=""
+
+build() {
+    git clone --depth 1 --branch "v$PKG_VERSION" "$SOURCE_URL" musl
+    cd musl
+    ./configure \
+        --prefix=/usr \
+        --syslibdir=/lib \
+        --disable-shared \
+        --enable-static
+    make -j$(nproc)
+    make DESTDIR="$PKG_ROOT" install
+}

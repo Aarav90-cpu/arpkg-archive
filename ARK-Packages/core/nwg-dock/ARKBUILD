@@ -1,0 +1,27 @@
+# ARKBUILD — nwg-dock
+# GTK4 Wayland dock — the macOS-style auto-hiding bottom dock in ARK OS
+PKG_NAME="nwg-dock"
+PKG_VERSION="0.4.1"
+SOURCE_URL="https://github.com/nwg-piotr/nwg-dock.git"
+DEPENDENCIES="musl gtk4"
+
+build() {
+    git clone --depth 1 --branch "v$PKG_VERSION" "$SOURCE_URL" nwg-dock
+    cd nwg-dock
+    # nwg-dock is Go; build a static binary
+    export CGO_ENABLED=0
+    export GOFLAGS="-ldflags=-extldflags=-static"
+    go build -o nwg-dock .
+    install -Dm755 nwg-dock "$PKG_ROOT/usr/bin/nwg-dock"
+    # Default style
+    mkdir -p "$PKG_ROOT/etc/nwg-dock"
+    cat > "$PKG_ROOT/etc/nwg-dock/style.css" << 'CSS'
+window { background: rgba(17,17,27,0.0); border: none; }
+#box { background: rgba(17,17,27,0.85); border-radius: 16px; padding: 4px 8px;
+       border: 1px solid rgba(89,89,128,0.3); }
+#button { background: transparent; border: none; border-radius: 10px;
+          margin: 2px; padding: 4px; transition: background 0.2s ease; }
+#button:hover { background: rgba(137,180,250,0.2); }
+#button.active { background: rgba(137,180,250,0.15); border: 1px solid rgba(137,180,250,0.4); }
+CSS
+}
