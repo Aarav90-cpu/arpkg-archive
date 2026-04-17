@@ -1,0 +1,10 @@
+{
+  "pkg_name": "waybar",
+  "maintainer": "ARK OS Core Team",
+  "email": "noreply@github.com",
+  "credits": [
+    "Original Author: Alexis Rouillard (Alexays)",
+    "Ported by: ARK OS Core Team"
+  ],
+  "support_url": "https://github.com/Aarav90-cpu/arpkg-archive/issues"
+}

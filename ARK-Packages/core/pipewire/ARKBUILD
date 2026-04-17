@@ -1,0 +1,23 @@
+# ARKBUILD — pipewire
+# Modern audio/video router — replaces PulseAudio
+# Required by Waybar volume module and Waydroid audio passthrough
+PKG_NAME="pipewire"
+PKG_VERSION="1.2.1"
+SOURCE_URL="https://gitlab.freedesktop.org/pipewire/pipewire.git"
+DEPENDENCIES="musl"
+
+build() {
+    git clone --depth 1 --branch "$PKG_VERSION" "$SOURCE_URL" pipewire
+    cd pipewire
+    meson setup build \
+        --prefix=/usr \
+        --buildtype=release \
+        -Doptimization=s \
+        -Dsystemd=disabled \
+        -Dsession-managers=[] \
+        -Dtests=disabled \
+        -Dexamples=disabled \
+        -Dman=disabled
+    ninja -C build -j$(nproc)
+    DESTDIR="$PKG_ROOT" ninja -C build install
+}

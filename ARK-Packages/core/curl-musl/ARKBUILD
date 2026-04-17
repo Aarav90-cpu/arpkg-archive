@@ -1,0 +1,27 @@
+# ARKBUILD — curl-musl
+# Statically linked curl used internally by arpkg for all package downloads
+PKG_NAME="curl-musl"
+PKG_VERSION="8.8.0"
+SOURCE_URL="https://github.com/curl/curl.git"
+DEPENDENCIES="musl openssl"
+
+build() {
+    local tag="curl-$(echo "$PKG_VERSION" | tr '.' '_')"
+    git clone --depth 1 --branch "$tag" "$SOURCE_URL" curl
+    cd curl
+    autoreconf -fi
+    ./configure \
+        --prefix=/usr \
+        --with-openssl \
+        --disable-shared \
+        --enable-static \
+        --disable-ldap \
+        --without-libpsl \
+        --without-libgsasl \
+        CFLAGS="-Os -pipe" \
+        LDFLAGS="-static"
+    make -j$(nproc)
+    make DESTDIR="$PKG_ROOT" install
+    test -f "$PKG_ROOT/usr/bin/curl" \
+        || { echo "ERROR: curl binary missing from install root"; exit 1; }
+}

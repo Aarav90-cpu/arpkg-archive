@@ -1,0 +1,23 @@
+# ARKBUILD — wlroots
+# Core Wayland compositor library — required by Hyprland and Sway
+PKG_NAME="wlroots"
+PKG_VERSION="0.18.0"
+SOURCE_URL="https://gitlab.freedesktop.org/wlroots/wlroots.git"
+DEPENDENCIES="musl"
+
+build() {
+    git clone --depth 1 --branch "$PKG_VERSION" "$SOURCE_URL" wlroots
+    cd wlroots
+    meson setup build \
+        --prefix=/usr \
+        --buildtype=release \
+        -Doptimization=s \
+        -Db_ndebug=true \
+        -Dxwayland=disabled \
+        -Dbackends=drm,libinput,headless \
+        -Drenderers=gles2 \
+        -Dallocators=gbm \
+        -Dexamples=false
+    ninja -C build -j$(nproc)
+    DESTDIR="$PKG_ROOT" ninja -C build install
+}

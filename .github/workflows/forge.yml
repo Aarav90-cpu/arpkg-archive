@@ -1,0 +1,319 @@
+name: "ARK Forge — Build & Package"
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "ARK-Packages/**"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  # ────────────────────────────────────────────────────────────────
+  # STAGE 1 — Validate submissions before touching a build machine
+  # ────────────────────────────────────────────────────────────────
+  validate:
+    name: "Validate Submission"
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+      has_packages: ${{ steps.detect.outputs.has_packages }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed packages
+        id: detect
+        run: |
+          # Collect unique package directories that changed
+          CHANGED_DIRS=$(git diff --name-only origin/${{ github.base_ref }}...HEAD \
+            | grep '^ARK-Packages/' \
+            | xargs -I{} dirname {} \
+            | sort -u)
+
+          if [[ -z "$CHANGED_DIRS" ]]; then
+            echo "has_packages=false" >> "$GITHUB_OUTPUT"
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Build JSON matrix
+          MATRIX_JSON=$(echo "$CHANGED_DIRS" | python3 -c "
+import sys, json
+dirs = [l.strip() for l in sys.stdin if l.strip()]
+items = [{'pkg_dir': d, 'pkg_name': d.split('/')[-1]} for d in dirs]
+print(json.dumps({'include': items}))
+")
+          echo "has_packages=true"   >> "$GITHUB_OUTPUT"
+          echo "matrix=$MATRIX_JSON" >> "$GITHUB_OUTPUT"
+          echo "Detected packages:"
+          echo "$CHANGED_DIRS"
+
+      - name: Validate all changed packages
+        run: |
+          FAILED=0
+
+          while IFS= read -r pkg_dir; do
+            [[ -z "$pkg_dir" ]] && continue
+            echo ""
+            echo "══════════════════════════════════════"
+            echo "  Validating: $pkg_dir"
+            echo "══════════════════════════════════════"
+
+            # ── Rule 1: ARKBUILD must exist ──────────────────────
+            if [[ ! -f "$pkg_dir/ARKBUILD" ]]; then
+              echo "❌ FAIL: Missing ARKBUILD in $pkg_dir"
+              FAILED=1; continue
+            fi
+
+            # ── Rule 2: pkginfo.json must exist ──────────────────
+            if [[ ! -f "$pkg_dir/pkginfo.json" ]]; then
+              echo "❌ FAIL: Missing pkginfo.json in $pkg_dir"
+              FAILED=1; continue
+            fi
+
+            # ── Rule 3: No binaries ───────────────────────────────
+            BINARIES=$(find "$pkg_dir" \( \
+              -name "*.tar.gz" -o -name "*.tar.bz2" -o \
+              -name "*.tar.xz" -o -name "*.bin"     -o \
+              -name "*.so"     -o -name "*.so.*"    -o \
+              -name "*.a"      -o -name "*.o" \) 2>/dev/null)
+            if [[ -n "$BINARIES" ]]; then
+              echo "❌ FAIL: Pre-compiled binaries detected in $pkg_dir:"
+              echo "$BINARIES"
+              FAILED=1; continue
+            fi
+
+            # ── Rule 4: No wget in ARKBUILD ───────────────────────
+            if grep -qE '^\s*wget ' "$pkg_dir/ARKBUILD"; then
+              echo "❌ FAIL: wget is not allowed in ARKBUILD ($pkg_dir)"
+              echo "   Use 'git clone' for source repos or 'curl' for tarballs."
+              FAILED=1; continue
+            fi
+
+            # ── Rule 5: validate pkginfo.json schema ─────────────
+            python3 - "$pkg_dir/pkginfo.json" <<'EOF'
+import json, sys
+REQUIRED = {"pkg_name", "maintainer", "email", "credits", "support_url"}
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except json.JSONDecodeError as e:
+    print(f"❌ FAIL: pkginfo.json is not valid JSON: {e}")
+    sys.exit(1)
+
+missing = REQUIRED - set(data.keys())
+if missing:
+    print(f"❌ FAIL: pkginfo.json missing required fields: {missing}")
+    sys.exit(1)
+
+if not isinstance(data["credits"], list):
+    print("❌ FAIL: 'credits' must be a JSON array")
+    sys.exit(1)
+
+if not data["pkg_name"].strip():
+    print("❌ FAIL: 'pkg_name' cannot be empty")
+    sys.exit(1)
+
+print(f"✅ OK: {path}")
+EOF
+            [[ $? -ne 0 ]] && { FAILED=1; continue; }
+
+            # ── Rule 6: ARKBUILD must define required vars ────────
+            for required_var in PKG_NAME PKG_VERSION SOURCE_URL; do
+              if ! grep -q "^${required_var}=" "$pkg_dir/ARKBUILD"; then
+                echo "❌ FAIL: ARKBUILD missing required variable: $required_var"
+                FAILED=1
+              fi
+            done
+
+            # ── Rule 7: ARKBUILD must define build() ──────────────
+            if ! grep -qE "^build\(\)" "$pkg_dir/ARKBUILD"; then
+              echo "❌ FAIL: ARKBUILD missing required function: build()"
+              echo "   Your ARKBUILD must define a build() function that fetches,"
+              echo "   compiles, and installs to \$PKG_ROOT."
+              FAILED=1
+            fi
+
+            echo "✅ PASS: $pkg_dir"
+          done < <(git diff --name-only origin/${{ github.base_ref }}...HEAD \
+            | grep '^ARK-Packages/' \
+            | xargs -I{} dirname {} \
+            | sort -u)
+
+          echo ""
+          if [[ $FAILED -ne 0 ]]; then
+            echo "❌ Validation failed. Fix the above errors before re-submitting."
+            exit 1
+          fi
+          echo "✅ All packages passed validation."
+
+  # ────────────────────────────────────────────────────────────────
+  # STAGE 2 — The Forge: compile each package in a clean musl env
+  # ────────────────────────────────────────────────────────────────
+  forge:
+    name: "Forge — ${{ matrix.pkg_name }}"
+    needs: validate
+    if: needs.validate.outputs.has_packages == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.validate.outputs.matrix) }}
+
+    container:
+      image: alpine:edge
+      options: --privileged
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install musl toolchain & universal build dependencies
+        run: |
+          apk update
+          apk add --no-cache \
+            build-base musl-dev musl-utils musl-fts-dev \
+            gcc g++ clang \
+            git curl bash \
+            autoconf automake libtool pkgconf \
+            meson ninja cmake samurai \
+            python3 py3-pip go \
+            openssl-dev zlib-dev \
+            linux-headers \
+            binutils file \
+            xz gzip bzip2 tar \
+            patch diffutils sed gawk \
+            coreutils findutils
+
+      - name: Prepare build environment
+        run: |
+          mkdir -p /tmp/build /tmp/pkgroot
+
+          # Export the musl cross-compile environment
+          echo "CC=gcc"                             >> "$GITHUB_ENV"
+          echo "CXX=g++"                            >> "$GITHUB_ENV"
+          echo "CFLAGS=-Os -pipe -fstack-protector" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=-Os -pipe"                 >> "$GITHUB_ENV"
+          echo "PKG_ROOT=/tmp/pkgroot"              >> "$GITHUB_ENV"
+
+      - name: Execute ARKBUILD — build()
+        run: |
+          source "${{ matrix.pkg_dir }}/ARKBUILD"
+          cd /tmp/build
+          echo "==> Building $PKG_NAME $PKG_VERSION against musl..."
+          build
+          echo "PKG_NAME=$PKG_NAME"       >> "$GITHUB_ENV"
+          echo "PKG_VERSION=$PKG_VERSION" >> "$GITHUB_ENV"
+        shell: bash
+
+      - name: Verify install root is not empty
+        run: |
+          if [[ -z "$(ls -A /tmp/pkgroot 2>/dev/null)" ]]; then
+            echo "❌ FAIL: PKG_ROOT (/tmp/pkgroot) is empty after compile()"
+            echo "   Ensure your compile() function runs 'make DESTDIR=\$PKG_ROOT install'"
+            exit 1
+          fi
+          echo "==> Install root contents:"
+          find /tmp/pkgroot -type f | head -40
+
+      - name: Package & hash
+        id: package
+        run: |
+          PKG_DIR="${{ matrix.pkg_dir }}"
+          TARBALL="${PKG_NAME}-${PKG_VERSION}.tar.gz"
+
+          # Bundle pkginfo.json into the package root
+          cp "${PKG_DIR}/pkginfo.json" /tmp/pkgroot/
+
+          # Create the final tarball
+          tar -czf "/tmp/${TARBALL}" -C /tmp/pkgroot .
+
+          # SHA-256 — the ground truth for arpkg verify
+          SHA256=$(sha256sum "/tmp/${TARBALL}" | awk '{print $1}')
+          echo "$SHA256  ${TARBALL}" > "/tmp/${TARBALL}.sha256"
+
+          echo "tarball=/tmp/${TARBALL}"   >> "$GITHUB_OUTPUT"
+          echo "sha256=${SHA256}"          >> "$GITHUB_OUTPUT"
+          echo "tarball_name=${TARBALL}"   >> "$GITHUB_OUTPUT"
+
+          echo "==> Package : ${TARBALL}"
+          echo "==> SHA-256 : ${SHA256}"
+          echo "==> Size    : $(du -sh /tmp/${TARBALL} | cut -f1)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ env.PKG_NAME }}-${{ env.PKG_VERSION }}"
+          path: |
+            /tmp/${{ steps.package.outputs.tarball_name }}
+            /tmp/${{ steps.package.outputs.tarball_name }}.sha256
+          retention-days: 90
+
+      - name: Write job summary
+        run: |
+          {
+            echo "## ✅ Forge Result — $PKG_NAME"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| **Package** | \`${PKG_NAME}\` |"
+            echo "| **Version** | \`${PKG_VERSION}\` |"
+            echo "| **SHA-256** | \`${{ steps.package.outputs.sha256 }}\` |"
+            echo "| **Tarball** | \`${{ steps.package.outputs.tarball_name }}\` |"
+            echo "| **Status**  | ✅ Build succeeded |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post result to PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ job.status }}' === 'success' ? '✅' : '❌';
+            const pkg    = process.env.PKG_NAME    || '${{ matrix.pkg_name }}';
+            const ver    = process.env.PKG_VERSION || 'unknown';
+            const sha    = '${{ steps.package.outputs.sha256 }}';
+            const body   = `### ${status} Forge: \`${pkg}\`\n\n` +
+              `| Field | Value |\n|---|---|\n` +
+              `| Version | \`${ver}\` |\n` +
+              `| SHA-256 | \`${sha || 'N/A'}\` |\n` +
+              `| Status | ${'${{ job.status }}'} |`;
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+  # ────────────────────────────────────────────────────────────────
+  # STAGE 3 — Final gate: all packages must pass
+  # ────────────────────────────────────────────────────────────────
+  gate:
+    name: "Forge Gate"
+    needs: [validate, forge]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Evaluate results
+        run: |
+          VALIDATE="${{ needs.validate.result }}"
+          FORGE="${{ needs.forge.result }}"
+
+          echo "Validate: $VALIDATE"
+          echo "Forge:    $FORGE"
+
+          if [[ "$VALIDATE" != "success" ]]; then
+            echo "❌ Validation stage failed. PR cannot be merged."
+            exit 1
+          fi
+
+          if [[ "$FORGE" == "failure" || "$FORGE" == "cancelled" ]]; then
+            echo "❌ One or more packages failed to build. PR cannot be merged."
+            exit 1
+          fi
+
+          echo "✅ All stages passed. PR is ready to merge."

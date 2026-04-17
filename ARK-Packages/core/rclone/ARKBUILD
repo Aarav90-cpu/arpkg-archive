@@ -1,0 +1,19 @@
+# ARKBUILD — rclone
+# Cloud sync tool powering ARK OS Google Drive backup.
+# Pure Go — compiles to a clean static binary with zero runtime dependencies.
+PKG_NAME="rclone"
+PKG_VERSION="1.67.0"
+SOURCE_URL="https://github.com/rclone/rclone.git"
+DEPENDENCIES=""
+
+build() {
+    git clone --depth 1 --branch "v$PKG_VERSION" "$SOURCE_URL" rclone
+    cd rclone
+    export CGO_ENABLED=0
+    export GOFLAGS="-ldflags=-extldflags=-static"
+    go build -o rclone .
+    install -Dm755 rclone "$PKG_ROOT/usr/bin/rclone"
+    # rclone man page
+    mkdir -p "$PKG_ROOT/usr/share/man/man1"
+    ./rclone genautocomplete bash "$PKG_ROOT/etc/bash_completion.d/rclone" 2>/dev/null || true
+}

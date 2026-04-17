@@ -1,0 +1,16 @@
+# ARK-Packages/community/
+#
+# This directory is for community-maintained packages.
+# Any contributor may submit a package here by following the
+# contribution guide in README.md.
+#
+# Community packages follow the same ARKBUILD + pkginfo.json format
+# as core packages, but are maintained by third-party contributors
+# rather than the ARK OS Core Team.
+#
+# Quality bar:
+#   - Passes the Forge CI/CD pipeline (same as core)
+#   - pkginfo.json must include accurate contributor details
+#   - Package must build cleanly against musl on Alpine Edge
+#
+# Submit a PR with your package directory to get started.
