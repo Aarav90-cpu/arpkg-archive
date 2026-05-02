@@ -66,7 +66,13 @@ EOF
 
 # ── Privilege check ──────────────────────────────────────────────────────────
 check_root() {
-    [[ $EUID -eq 0 ]] || die "arpkg requires root privileges. Use: sudo arpkg $*"
+    [[ $EUID -eq 0 ]] && return 0
+    if command -v sudo &>/dev/null; then
+        die "arpkg requires root privileges. Use: sudo arpkg ..."
+    else
+        # sudo not installed — skip the hard requirement
+        log_warn "arpkg requires root privileges, but sudo is not installed — proceeding without privilege check."
+    fi
 }
 
 # ── Bootstrap directory structure ────────────────────────────────────────────
@@ -81,8 +87,8 @@ init_dirs() {
         cat > "$SOURCES_LIST" <<'SOURCES'
 # ARK OS Package Sources
 # Format: ark <base_url> <branch>
-ark https://raw.githubusercontent.com/Aarav90-cpu/arpkg-archive/main core
-ark https://raw.githubusercontent.com/Aarav90-cpu/arpkg-archive/main community
+ark https://raw.githubusercontent.com/Aarav90-cpu/arpkg-archive/master core
+ark https://raw.githubusercontent.com/Aarav90-cpu/arpkg-archive/master community
 SOURCES
     fi
 
@@ -170,6 +176,120 @@ get_installed_version() {
     grep "^${1}|" "$PKG_DB" 2>/dev/null | cut -d'|' -f2
 }
 
+# ── Install helpers ──────────────────────────────────────────────────────────
+
+# Fetch download size in bytes via HTTP HEAD (returns 0 on failure)
+_get_pkg_size() {
+    local url="$1"
+    local sz
+    sz=$(curl -fsSI --connect-timeout 5 --max-time 8 "$url" 2>/dev/null \
+        | grep -i "^content-length:" | tail -1 | awk '{print $2}' | tr -d '\r')
+    printf '%s' "${sz:-0}"
+}
+
+# Format raw bytes → human-readable string
+_format_size() {
+    local bytes="${1:-0}"
+    if [[ "$bytes" -le 0 ]]; then printf '?'; return; fi
+    if   [[ $bytes -ge 1073741824 ]]; then awk "BEGIN{printf \"%.1f GB\",$bytes/1073741824}"
+    elif [[ $bytes -ge 1048576    ]]; then awk "BEGIN{printf \"%.1f MB\",$bytes/1048576}"
+    elif [[ $bytes -ge 1024       ]]; then awk "BEGIN{printf \"%.1f KB\",$bytes/1024}"
+    else printf '%d B' "$bytes"
+    fi
+}
+
+# Render a TOTAL progress bar (prints in-place; caller adds newline)
+_draw_progress_bar() {
+    local current="$1" total="${2:-0}" width=36
+    local pct=0 filled=0
+    if [[ $total -gt 0 ]]; then
+        pct=$(( current * 100 / total ))
+        filled=$(( pct * width / 100 ))
+    fi
+    local empty=$(( width - filled ))
+    local bar="" i
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty; i++)); do bar+="░"; done
+    printf "  ${BOLD}TOTAL${NC}  [${CYAN}%s${NC}] %3d%%  %s / %s  " \
+        "$bar" "$pct" "$(_format_size "$current")" "$(_format_size "$total")"
+}
+
+# Delegate a package list to the active servant, printing rich status
+_servant_install() {
+    local servant="$1"; shift
+    local pkgs=("$@")
+    local apt_bin="apt"
+    [[ "$servant" == "apt" && -x "$SHADOW_APT" ]] && apt_bin="$SHADOW_APT"
+
+    echo ""
+    echo -e "${BOLD}  ┌─────────────────────────────────────────────┐${NC}"
+    printf  "  ${BOLD}│${NC}  🤝 Servant Mode  %-27s${BOLD}│${NC}\n" "[ ${servant} ]"
+    echo -e "${BOLD}  └─────────────────────────────────────────────┘${NC}"
+    echo ""
+    log_info  "Packages not in arpkg index — delegating to servant."
+    log_step  "[ ✨ Vibe-checking dependencies... ]"
+    echo ""
+
+    local exit_code=0
+    case "$servant" in
+        apt)    "$apt_bin" install -y "${pkgs[@]}"     || exit_code=$? ;;
+        pacman) pacman -S --noconfirm "${pkgs[@]}"     || exit_code=$? ;;
+        yay|paru) "$servant" -S --noconfirm "${pkgs[@]}" || exit_code=$? ;;
+        *)        "$servant" install "${pkgs[@]}"      || exit_code=$? ;;
+    esac
+
+    echo ""
+    if [[ $exit_code -eq 0 ]]; then
+        log_success "Servant ${servant}: all packages installed successfully."
+    else
+        log_error   "Servant ${servant}: exited with code ${exit_code}."
+    fi
+    return $exit_code
+}
+
+# Verify SHA-256, print status, extract, detect kernel rebuild, register in DB.
+# Assumes tarball is already present in PKG_CACHE/downloads/.
+_verify_and_extract() {
+    local pkg="$1" verbose="$2"
+    local entry; entry=$(lookup_pkg "$pkg") || die "Package '${pkg}' not found."
+    parse_index_line "$entry"
+    local tarball="${PKG_CACHE}/downloads/${PKG_FIELD_NAME}-${PKG_FIELD_VER}.tar.gz"
+
+    # ── Verify SHA-256 (Zero-Trust: no exceptions) ──
+    log_step "  Verifying ${BOLD}${PKG_FIELD_NAME}${NC}..."
+    local actual_sha; actual_sha=$(sha256sum "$tarball" | awk '{print $1}')
+    if [[ "$actual_sha" != "$PKG_FIELD_SHA" ]]; then
+        rm -f "$tarball"
+        die "SHA-256 MISMATCH — ${pkg} discarded!\n  Expected: ${PKG_FIELD_SHA}\n  Got: ${actual_sha}"
+    fi
+    log_success "  Checksum OK."
+
+    # ── Installing status ──
+    echo -e "  ${CYAN}[ ⚙ ]${NC} Installing (${BOLD}${PKG_FIELD_NAME}${NC} ${PKG_FIELD_VER})..."
+
+    # ── Kernel rebuild detection ──
+    if [[ "$PKG_FIELD_NAME" =~ ^linux|^kernel ]]; then
+        echo ""
+        echo -e "  ${YELLOW}[ 🔧 Rebuilding kernel... ]${NC}  Please wait, this may take a moment."
+        # Run post-kernel hook if the distro provides one
+        if [[ -x /usr/lib/arpkg/hooks/post-kernel-install ]]; then
+            /usr/lib/arpkg/hooks/post-kernel-install "$PKG_FIELD_NAME" "$PKG_FIELD_VER"
+        fi
+        echo ""
+    fi
+
+    # ── Extract to root filesystem ──
+    if [[ "$verbose" == true ]]; then
+        tar -xzvf "$tarball" -C / 2>&1 | grep -v '^\./$' || die "Extraction failed for ${pkg}."
+    else
+        tar -xzf "$tarball" -C / || die "Extraction failed for ${pkg}."
+    fi
+
+    # ── Register in DB ──
+    echo "${PKG_FIELD_NAME}|${PKG_FIELD_VER}|${PKG_FIELD_SHA}|$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$PKG_DB"
+    log_success "  ${PKG_FIELD_NAME} ${PKG_FIELD_VER} ✓"
+}
+
 # ── cmd: install ─────────────────────────────────────────────────────────────
 cmd_install() {
     check_root
@@ -189,16 +309,31 @@ cmd_install() {
     done
 
     [[ ${#real_pkgs[@]} -gt 0 ]] || die "No packages specified."
-    [[ -s "$PKG_INDEX"        ]] || die "Index is empty. Run 'arpkg update' first."
 
-    local visited=() order=()
+    # ── Partition: arpkg-managed vs servant fallback vs not found ─────────────
+    local arpkg_queue=() servant_queue=()
 
     for pkg in "${real_pkgs[@]}"; do
         if is_installed "$pkg"; then
-            log_warn "${pkg} is already installed \
-($(get_installed_version "$pkg")). Skipping."
+            log_warn "${pkg} is already installed ($(get_installed_version "$pkg")). Skipping."
             continue
         fi
+        if [[ -s "$PKG_INDEX" ]] && lookup_pkg "$pkg" &>/dev/null; then
+            arpkg_queue+=("$pkg")
+        else
+            local _sv; _sv=$(get_active_servant)
+            if [[ -n "$_sv" ]]; then
+                servant_queue+=("$pkg")
+                log_info "[ 🔀 ] '${pkg}' not in arpkg index — queued for servant (${_sv})."
+            else
+                die "No such package: '${pkg}' — not found in arpkg index and no servant is configured."
+            fi
+        fi
+    done
+
+    # ── Resolve dependency order for arpkg packages ───────────────────────────
+    local visited=() order=()
+    for pkg in "${arpkg_queue[@]}"; do
         if [[ "$no_deps" == true ]]; then
             order+=("$pkg")
         else
@@ -206,29 +341,99 @@ cmd_install() {
         fi
     done
 
-    [[ ${#order[@]} -gt 0 ]] || { log_info "Nothing to install."; return 0; }
+    [[ ${#order[@]} -eq 0 && ${#servant_queue[@]} -eq 0 ]] \
+        && { log_info "Nothing to install."; return 0; }
 
-    echo ""
-    echo -e "${BOLD}The following ${#order[@]} package(s) will be installed:${NC}"
-    for pkg in "${order[@]}"; do
-        local entry; entry=$(lookup_pkg "$pkg")
-        parse_index_line "$entry"
-        echo -e "  ${GREEN}+${NC} ${BOLD}${PKG_FIELD_NAME}${NC} ${PKG_FIELD_VER}"
-    done
-    echo ""
+    # ── Collect metadata + sizes ──────────────────────────────────────────────
+    declare -A _pver _purl _psha _psz
+    local total_bytes=0
 
-    if [[ "$auto_yes" != true ]]; then
-        read -rp "Proceed? [Y/n] " confirm
-        [[ "$confirm" =~ ^[Nn]$ ]] && { log_info "Aborted."; exit 0; }
+    if [[ ${#order[@]} -gt 0 ]]; then
+        log_step "Fetching package metadata..."
+        for pkg in "${order[@]}"; do
+            local entry; entry=$(lookup_pkg "$pkg")
+            parse_index_line "$entry"
+            _pver["$pkg"]="$PKG_FIELD_VER"
+            _purl["$pkg"]="$PKG_FIELD_URL"
+            _psha["$pkg"]="$PKG_FIELD_SHA"
+            local sz; sz=$(_get_pkg_size "$PKG_FIELD_URL")
+            _psz["$pkg"]="${sz:-0}"
+            total_bytes=$(( total_bytes + ${sz:-0} ))
+        done
     fi
 
+    # ── Installation table ────────────────────────────────────────────────────
+    local _sep="──────────────────────────┬──────────────────┬────────────"
+    echo ""
+    echo -e "${BOLD}  ┌${_sep}┐${NC}"
+    printf  "  ${BOLD}│ %-26s│ %-18s│ %-11s│${NC}\n" "Package" "Version" "Size"
+    echo -e "  ${BOLD}├${_sep}┤${NC}"
     for pkg in "${order[@]}"; do
-        _install_single "$pkg" "$verbose"
+        local sfmt; sfmt=$(_format_size "${_psz[$pkg]:-0}")
+        printf "  │ ${GREEN}%-26s${NC}│ %-18s│ %-11s│\n" \
+            "$pkg" "${_pver[$pkg]}" "$sfmt"
     done
+    for pkg in "${servant_queue[@]}"; do
+        local _sname; _sname=$(get_active_servant)
+        printf "  │ ${YELLOW}%-26s${NC}│ %-18s│ %-11s│\n" \
+            "$pkg" "(servant: ${_sname})" "?"
+    done
+    echo -e "  └${_sep}┘"
+    local _total_fmt; _total_fmt=$(_format_size "$total_bytes")
+    local _total_count=$(( ${#order[@]} + ${#servant_queue[@]} ))
+    echo ""
+    echo -e "  ${BOLD}${_total_count} package(s)${NC}  •  arpkg: ${#order[@]}  •  servant: ${#servant_queue[@]}  •  download: ${_total_fmt}"
+    echo ""
 
-    log_success "Done. ${#order[@]} package(s) installed."
+    # ── Confirm ───────────────────────────────────────────────────────────────
+    if [[ "$auto_yes" != true ]]; then
+        read -rp "Proceed with installation? [Y/n] " _conf
+        [[ "$_conf" =~ ^[Nn]$ ]] && { log_info "Aborted."; exit 0; }
+    fi
+    echo ""
+
+    # ── Download phase — single TOTAL progress bar ────────────────────────────
+    if [[ ${#order[@]} -gt 0 ]]; then
+        echo -e "${BOLD}  [ ↓ ] Downloading ${#order[@]} package(s)...${NC}"
+        echo ""
+        local _dl_done=0 _dl_bytes=0
+        for pkg in "${order[@]}"; do
+            _dl_done=$(( _dl_done + 1 ))
+            local _ver="${_pver[$pkg]}" _url="${_purl[$pkg]}"
+            local _tb="${PKG_CACHE}/downloads/${pkg}-${_ver}.tar.gz"
+            printf "  ${CYAN}[%d/%d]${NC} Fetching ${BOLD}%s${NC} %s ...\n" \
+                "$_dl_done" "${#order[@]}" "$pkg" "$_ver"
+            curl -fL --silent --connect-timeout 15 --max-time 300 \
+                -o "$_tb" "$_url" \
+                || die "Download failed for ${pkg}."
+            _dl_bytes=$(( _dl_bytes + ${_psz[$pkg]:-0} ))
+            _draw_progress_bar "$_dl_bytes" "$total_bytes"; echo ""
+        done
+        echo ""
+        log_success "All packages downloaded.  Total: ${_total_fmt}"
+        echo ""
+    fi
+
+    # ── Install phase ─────────────────────────────────────────────────────────
+    if [[ ${#order[@]} -gt 0 ]]; then
+        echo -e "${BOLD}  [ ⚙ ] Installing packages...${NC}"
+        echo ""
+        for pkg in "${order[@]}"; do
+            _verify_and_extract "$pkg" "$verbose"
+        done
+        echo ""
+        log_success "arpkg: ${#order[@]} package(s) installed."
+        echo ""
+    fi
+
+    # ── Servant phase ─────────────────────────────────────────────────────────
+    if [[ ${#servant_queue[@]} -gt 0 ]]; then
+        local _sv; _sv=$(get_active_servant)
+        _servant_install "$_sv" "${servant_queue[@]}"
+    fi
 }
 
+# _install_single — used by cmd_upgrade (single package, downloads inline)
 _install_single() {
     local pkg="$1" verbose="$2"
     local entry; entry=$(lookup_pkg "$pkg") || die "Package '${pkg}' not found."
@@ -244,31 +449,7 @@ _install_single() {
         -o "$tarball" "$PKG_FIELD_URL" \
         || die "Download failed for ${pkg}."
 
-    # ── Verify SHA-256 (Zero-Trust: no exceptions) ──
-    log_step "  Verifying SHA-256..."
-    local actual_sha; actual_sha=$(sha256sum "$tarball" | awk '{print $1}')
-
-    if [[ "$actual_sha" != "$PKG_FIELD_SHA" ]]; then
-        rm -f "$tarball"
-        die "SHA-256 MISMATCH — package discarded!\n" \
-            "  Expected: ${PKG_FIELD_SHA}\n" \
-            "  Got:      ${actual_sha}"
-    fi
-    log_success "  Checksum OK."
-
-    # ── Extract to root filesystem ──
-    log_step "  Extracting to /..."
-    if [[ "$verbose" == true ]]; then
-        tar -xzvf "$tarball" -C / 2>&1 | grep -v '^\./$' || die "Extraction failed."
-    else
-        tar -xzf "$tarball" -C / || die "Extraction failed for ${pkg}."
-    fi
-
-    # ── Register in DB ──
-    echo "${PKG_FIELD_NAME}|${PKG_FIELD_VER}|${PKG_FIELD_SHA}|\
-$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$PKG_DB"
-
-    log_success "  ${PKG_FIELD_NAME} ${PKG_FIELD_VER} installed."
+    _verify_and_extract "$pkg" "$verbose"
 }
 
 # ── cmd: remove ──────────────────────────────────────────────────────────────
