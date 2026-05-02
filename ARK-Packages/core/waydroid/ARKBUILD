@@ -1,0 +1,23 @@
+# ARKBUILD — waydroid
+# Runs Android (LineageOS) apps natively in the ARK OS Wayland session
+# via LXC container + kernel binder/ashmem modules.
+# Requires linux-zen compiled with CONFIG_ANDROID_BINDER_IPC=y
+PKG_NAME="waydroid"
+PKG_VERSION="1.4.3"
+SOURCE_URL="https://github.com/waydroid/waydroid.git"
+DEPENDENCIES="musl"
+
+build() {
+    git clone --depth 1 --branch "$PKG_VERSION" "$SOURCE_URL" waydroid
+    cd waydroid
+    # Waydroid is a Python application — install files directly
+    install -Dm755 waydroid.py        "$PKG_ROOT/usr/bin/waydroid"
+    install -Dm644 waydroid/main.py   "$PKG_ROOT/usr/lib/waydroid/main.py"
+    cp -r data/                       "$PKG_ROOT/usr/share/waydroid/"
+    cp -r waydroid/                   "$PKG_ROOT/usr/lib/waydroid/"
+    # Kernel modules config (binder + ashmem — must be loaded by ark-init)
+    mkdir -p "$PKG_ROOT/etc/modules-load.d"
+    printf 'binder_linux\nashmem_linux\n' > "$PKG_ROOT/etc/modules-load.d/waydroid.conf"
+    # LXC config directory
+    mkdir -p "$PKG_ROOT/var/lib/waydroid"
+}

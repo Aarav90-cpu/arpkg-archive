@@ -1,0 +1,64 @@
+# ARKBUILD — waybar
+# Highly customisable Wayland bar — serves as the GNOME-style top panel in ARK OS
+PKG_NAME="waybar"
+PKG_VERSION="0.10.4"
+SOURCE_URL="https://github.com/Alexays/Waybar.git"
+DEPENDENCIES="musl wlroots gtk4"
+
+build() {
+    git clone --depth 1 --branch "$PKG_VERSION" "$SOURCE_URL" Waybar
+    cd Waybar
+    meson setup build \
+        --prefix=/usr \
+        --buildtype=release \
+        -Doptimization=s \
+        -Dsystemd=disabled \
+        -Ddbusmenu-gtk=disabled \
+        -Dmpd=disabled \
+        -Dmpris=disabled \
+        -Dnls=disabled \
+        -Dlibudev=disabled
+    ninja -C build -j$(nproc)
+    DESTDIR="$PKG_ROOT" ninja -C build install
+
+    # ARK OS default config (GNOME-style top bar)
+    mkdir -p "$PKG_ROOT/etc/waybar"
+    cat > "$PKG_ROOT/etc/waybar/config.jsonc" << 'CONF'
+{
+    "layer": "top", "position": "top", "height": 36, "spacing": 4,
+    "modules-left":   ["hyprland/workspaces", "hyprland/window"],
+    "modules-center": ["clock"],
+    "modules-right":  ["pulseaudio","network","battery","cpu","memory","tray","custom/power"],
+    "hyprland/workspaces": { "format": "{name}", "on-click": "activate", "sort-by-number": true },
+    "clock": { "format": "{:%a %b %d  %H:%M}", "tooltip-format": "<big>{:%Y %B}</big>\n<tt>{calendar}</tt>" },
+    "cpu":     { "format": " {usage}%", "interval": 2 },
+    "memory":  { "format": " {}%", "interval": 5 },
+    "battery": { "states": {"warning":30,"critical":15},
+                 "format": "{icon} {capacity}%", "format-charging": " {capacity}%",
+                 "format-icons": ["","","","",""] },
+    "network": { "format-wifi": " {signalStrength}%", "format-ethernet": " {ifname}",
+                 "format-disconnected": "⚠ Disconnected" },
+    "pulseaudio": { "format": "{icon} {volume}%", "format-muted": " Muted",
+                    "format-icons": {"default":["","",""]}, "scroll-step": 5 },
+    "tray": { "spacing": 8 },
+    "custom/power": { "format": "⏻", "tooltip": false, "on-click": "ark-power-menu" }
+}
+CONF
+
+    # Theme CSS (reads accent from /etc/ark/theme.css)
+    cat > "$PKG_ROOT/etc/waybar/style.css" << 'CSS'
+@import "/etc/ark/theme.css";
+* { font-family: "Inter", sans-serif; font-size: 13px; min-height: 0; border: none; }
+window#waybar { background: rgba(17,17,27,0.85); color: var(--ark-fg,#cdd6f4);
+                border-bottom: 1px solid rgba(89,89,128,0.3); }
+#workspaces button { padding: 0 8px; background: transparent; color: var(--ark-fg-muted,#a6adc8);
+                     border-radius: 6px; margin: 4px 2px; transition: all 0.2s ease; }
+#workspaces button.active { background: var(--ark-accent,#89b4fa); color: #1e1e2e; font-weight: 600; }
+#clock { font-weight: 600; }
+#battery.warning  { color: #f9e2af; }
+#battery.critical { color: #f38ba8; }
+#battery.charging { color: #a6e3a1; }
+#custom-power     { padding: 0 12px; font-size: 16px; }
+#custom-power:hover { color: #f38ba8; }
+CSS
+}

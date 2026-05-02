@@ -1,0 +1,46 @@
+# ARKBUILD — acpid
+# ACPI event daemon: battery, lid, power button, CPU governor management
+PKG_NAME="acpid"
+PKG_VERSION="2.0.34"
+SOURCE_URL="https://github.com/proycon/acpid.git"
+DEPENDENCIES="musl"
+
+build() {
+    git clone --depth 1 "$SOURCE_URL" acpid
+    cd acpid
+    make -j$(nproc) \
+        CC="${CC:-gcc}" \
+        CFLAGS="${CFLAGS:--Os -pipe}" \
+        LDFLAGS="${LDFLAGS:--static}"
+    make DESTDIR="$PKG_ROOT" PREFIX=/usr install
+    mkdir -p "$PKG_ROOT/etc/acpi/events"
+    mkdir -p "$PKG_ROOT/etc/acpi/actions"
+
+    # Power button → clean shutdown
+    printf 'event=button/power\naction=/etc/acpi/actions/power.sh\n' \
+        > "$PKG_ROOT/etc/acpi/events/power-button"
+    printf '#!/bin/sh\nlogger -t acpid "Power button pressed"\npoweroff\n' \
+        > "$PKG_ROOT/etc/acpi/actions/power.sh"
+    chmod +x "$PKG_ROOT/etc/acpi/actions/power.sh"
+
+    # Lid close → suspend
+    printf 'event=button/lid LID close\naction=/etc/acpi/actions/lid.sh\n' \
+        > "$PKG_ROOT/etc/acpi/events/lid-close"
+    printf '#!/bin/sh\nlogger -t acpid "Lid closed"\necho mem > /sys/power/state\n' \
+        > "$PKG_ROOT/etc/acpi/actions/lid.sh"
+    chmod +x "$PKG_ROOT/etc/acpi/actions/lid.sh"
+
+    # AC adapter → CPU governor switch (performance/powersave)
+    printf 'event=ac_adapter\naction=/etc/acpi/actions/ac-power.sh\n' \
+        > "$PKG_ROOT/etc/acpi/events/ac-adapter"
+    cat > "$PKG_ROOT/etc/acpi/actions/ac-power.sh" << 'SCRIPT'
+#!/bin/sh
+AC=$(cat /sys/class/power_supply/AC*/online 2>/dev/null | head -1)
+GOV="powersave"; [ "$AC" = "1" ] && GOV="performance"
+for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    echo "$GOV" > "$cpu" 2>/dev/null || true
+done
+logger -t acpid "AC event — governor: $GOV"
+SCRIPT
+    chmod +x "$PKG_ROOT/etc/acpi/actions/ac-power.sh"
+}

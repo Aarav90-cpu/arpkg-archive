@@ -1,0 +1,74 @@
+# ARKBUILD — hyprland
+# Dynamic tiling Wayland compositor with macOS-quality animations,
+# rounded corners, and blur. The visual heart of ARK OS.
+PKG_NAME="hyprland"
+PKG_VERSION="0.41.2"
+SOURCE_URL="https://github.com/hyprwm/Hyprland.git"
+DEPENDENCIES="musl wlroots"
+
+build() {
+    git clone --depth 1 --branch "v$PKG_VERSION" --recurse-submodules \
+        "$SOURCE_URL" Hyprland
+    cd Hyprland
+    cmake -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_C_FLAGS="-Os -pipe" \
+        -DCMAKE_CXX_FLAGS="-Os -pipe" \
+        -DNO_SYSTEMD=ON \
+        -DWITH_SYSTEMD=OFF
+    cmake --build build -j$(nproc)
+    DESTDIR="$PKG_ROOT" cmake --install build
+
+    # Default ARK OS config
+    mkdir -p "$PKG_ROOT/etc/hypr"
+    cat > "$PKG_ROOT/etc/hypr/hyprland.conf" << 'CONF'
+monitor=,preferred,auto,1
+
+decoration {
+    rounding = 12
+    blur { enabled = true; size = 6; passes = 3; new_optimizations = true }
+    drop_shadow = true
+    shadow_range = 20
+    col.shadow = rgba(1a1a1aee)
+}
+
+animations {
+    enabled = true
+    bezier = macOS, 0.25, 1, 0.5, 1
+    animation = windows,    1, 5, macOS, popin 80%
+    animation = windowsOut, 1, 5, macOS, popin 80%
+    animation = workspaces, 1, 6, macOS, slidevert
+    animation = fade,       1, 5, default
+}
+
+general {
+    gaps_in = 6; gaps_out = 12; border_size = 2
+    col.active_border   = rgba(89b4faee) rgba(cba6f7ee) 45deg
+    col.inactive_border = rgba(45475aaa)
+    layout = dwindle
+}
+
+input {
+    kb_layout = us
+    follow_mouse = 1
+    touchpad { natural_scroll = true; tap-to-click = true }
+}
+
+exec-once = waybar
+exec-once = nwg-dock -d -i 48 -mb 8
+
+$mod = SUPER
+bind = $mod,       RETURN, exec,          foot
+bind = $mod,       Q,      killactive
+bind = $mod SHIFT, E,      exit
+bind = $mod,       F,      fullscreen
+bind = $mod,       SPACE,  togglefloating
+bind = $mod,       left,   movefocus, l
+bind = $mod,       right,  movefocus, r
+bind = $mod,       up,     movefocus, u
+bind = $mod,       down,   movefocus, d
+bindm = $mod, mouse:272, movewindow
+bindm = $mod, mouse:273, resizewindow
+CONF
+}

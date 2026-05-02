@@ -1,0 +1,11 @@
+{
+  "pkg_name": "linux-zen",
+  "maintainer": "ARK OS Core Team",
+  "email": "noreply@github.com",
+  "credits": [
+    "Original Author: The Zen Kernel project",
+    "Android binder patches: The Android Open Source Project",
+    "Ported by: ARK OS Core Team"
+  ],
+  "support_url": "https://github.com/Aarav90-cpu/arpkg-archive/issues"
+}

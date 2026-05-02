@@ -1,0 +1,22 @@
+# ARKBUILD — busybox
+# Statically linked against musl for ARK OS base userland
+PKG_NAME="busybox"
+PKG_VERSION="1.36.1"
+SOURCE_URL="https://git.busybox.net/busybox"
+DEPENDENCIES=""
+
+build() {
+    git clone --depth 1 --branch "$PKG_VERSION" "$SOURCE_URL" busybox
+    cd busybox
+    make defconfig
+    sed -i \
+        -e 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' \
+        -e 's/CONFIG_SUID=y/# CONFIG_SUID is not set/' \
+        .config
+    make oldconfig
+    make -j$(nproc) \
+        CC="${CC:-gcc}" \
+        CFLAGS="${CFLAGS:--Os -pipe}" \
+        LDFLAGS="${LDFLAGS:--static}"
+    make CONFIG_PREFIX="$PKG_ROOT" install
+}

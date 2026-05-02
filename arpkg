@@ -1,0 +1,647 @@
+#!/bin/bash
+# =============================================================================
+#  arpkg — ARK OS Package Manager
+#  Zero-trust, source-compiled, SHA-256 verified package management.
+#  Part of the ARK OS project.
+# =============================================================================
+
+set -euo pipefail
+
+ARPKG_VERSION="0.1.0"
+SOURCES_LIST="/etc/arpkg/sources.list"
+PKG_DB="/var/lib/arpkg/installed.db"
+PKG_CACHE="/var/cache/arpkg"
+PKG_INDEX="/var/lib/arpkg/index.db"
+SERVANT_CONF="/etc/arpkg/servant.conf"
+SHADOW_APT="/usr/lib/arpkg/shadow_realm/backend_apt_do_not_touch"
+
+# ── Colors ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m';  GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m';  BOLD='\033[1m'; NC='\033[0m'
+
+log_info()    { echo -e "${BLUE}[arpkg]${NC} $*"; }
+log_success() { echo -e "${GREEN}[✓]${NC} $*"; }
+log_warn()    { echo -e "${YELLOW}[!]${NC} $*"; }
+log_error()   { echo -e "${RED}[✗]${NC} $*" >&2; }
+log_step()    { echo -e "${CYAN}[→]${NC} $*"; }
+die()         { log_error "$*"; exit 1; }
+
+usage() {
+    cat <<EOF
+${BOLD}arpkg${NC} ${ARPKG_VERSION} — ARK OS Package Manager
+
+${BOLD}USAGE:${NC}
+  arpkg <command> [options] [package...]
+
+${BOLD}COMMANDS:${NC}
+  install  <pkg>   Install one or more packages (resolves dependencies)
+  remove   <pkg>   Remove an installed package
+  update           Sync package index from all configured sources
+  upgrade          Upgrade all outdated installed packages
+  search   <query> Search for packages by name or description
+  info     <pkg>   Show detailed package information
+  list             List all installed packages
+  list-all         List all packages available in the index
+  deps     <pkg>   Print the full dependency tree for a package
+  verify   <pkg>   Re-verify the SHA-256 integrity of an installed package
+  clean            Clear the package download cache
+  yay      <pkg>   Install via the Arch Subsystem (Developer Options only)
+
+${BOLD}SERVANT COMMANDS:${NC}
+  --servant add <name>            Register a backend servant (apt, pacman, yay)
+                                  apt   — Debian/Ubuntu-based systems only
+                                  pacman/yay — Arch-based systems only
+  --add --confirm <repo_url>      Add a third-party repo to the active servant's
+                                  sources (--confirm required to acknowledge risk)
+
+${BOLD}OPTIONS:${NC}
+  -y, --yes        Skip all confirmation prompts
+  -v, --verbose    Verbose tar extraction output
+  --no-deps        Install package without resolving dependencies
+  -h, --help       Print this help message
+  --version        Print arpkg version
+
+EOF
+}
+
+# ── Privilege check ──────────────────────────────────────────────────────────
+check_root() {
+    [[ $EUID -eq 0 ]] || die "arpkg requires root privileges. Use: sudo arpkg $*"
+}
+
+# ── Bootstrap directory structure ────────────────────────────────────────────
+init_dirs() {
+    mkdir -p \
+        /etc/arpkg \
+        /var/lib/arpkg \
+        /var/cache/arpkg/downloads \
+        /var/cache/arpkg/extracted
+
+    if [[ ! -f "$SOURCES_LIST" ]]; then
+        cat > "$SOURCES_LIST" <<'SOURCES'
+# ARK OS Package Sources
+# Format: ark <base_url> <branch>
+ark https://raw.githubusercontent.com/Aarav90-cpu/arpkg-archive/main core
+ark https://raw.githubusercontent.com/Aarav90-cpu/arpkg-archive/main community
+SOURCES
+    fi
+
+    [[ -f "$PKG_DB"    ]] || touch "$PKG_DB"
+    [[ -f "$PKG_INDEX" ]] || touch "$PKG_INDEX"
+}
+
+# ── Index field parser ───────────────────────────────────────────────────────
+# Index line format: name|version|sha256|deps|url|description
+parse_index_line() {
+    local line="$1"
+    PKG_FIELD_NAME=$(cut -d'|' -f1 <<< "$line")
+    PKG_FIELD_VER=$(cut  -d'|' -f2 <<< "$line")
+    PKG_FIELD_SHA=$(cut  -d'|' -f3 <<< "$line")
+    PKG_FIELD_DEPS=$(cut -d'|' -f4 <<< "$line")
+    PKG_FIELD_URL=$(cut  -d'|' -f5 <<< "$line")
+    PKG_FIELD_DESC=$(cut -d'|' -f6 <<< "$line")
+}
+
+lookup_pkg() {
+    local pkg="$1"
+    grep "^${pkg}|" "$PKG_INDEX" 2>/dev/null | head -1
+}
+
+# ── cmd: update ─────────────────────────────────────────────────────────────
+cmd_update() {
+    init_dirs
+    log_info "Syncing package index..."
+    [[ -f "$SOURCES_LIST" ]] || die "No sources list at $SOURCES_LIST"
+
+    > "${PKG_INDEX}.tmp"
+
+    while IFS= read -r line; do
+        [[ "$line" =~ ^#|^$ ]] && continue
+        local type url branch
+        read -r type url branch <<< "$line"
+        local index_url="${url}/releases/download/index/${branch}.index"
+        log_step "Fetching ${branch} from ${url}..."
+        if curl -fsSL --connect-timeout 10 --max-time 30 \
+               "$index_url" >> "${PKG_INDEX}.tmp" 2>/dev/null; then
+            log_success "Synced: ${branch}"
+        else
+            log_warn "Unreachable: ${url} — skipping"
+        fi
+    done < "$SOURCES_LIST"
+
+    mv "${PKG_INDEX}.tmp" "$PKG_INDEX"
+    local count; count=$(wc -l < "$PKG_INDEX")
+    log_success "Index updated. ${count} packages available."
+}
+
+# ── Dependency resolution (DFS topological sort) ─────────────────────────────
+resolve_deps() {
+    local pkg="$1"
+    local -n _vis=$2
+    local -n _ord=$3
+
+    # Already processed this node
+    [[ " ${_vis[*]} " =~ " ${pkg} " ]] && return 0
+    _vis+=("$pkg")
+
+    local entry
+    entry=$(lookup_pkg "$pkg") \
+        || die "Package '${pkg}' not found in index. Run 'arpkg update'."
+    parse_index_line "$entry"
+
+    if [[ -n "$PKG_FIELD_DEPS" ]]; then
+        IFS=',' read -ra _deps <<< "$PKG_FIELD_DEPS"
+        for dep in "${_deps[@]}"; do
+            dep="${dep// /}"
+            [[ -z "$dep" ]] && continue
+            is_installed "$dep" || resolve_deps "$dep" _vis _ord
+        done
+    fi
+
+    _ord+=("$pkg")
+}
+
+# ── Installed DB helpers ─────────────────────────────────────────────────────
+is_installed() {
+    grep -q "^${1}|" "$PKG_DB" 2>/dev/null
+}
+
+get_installed_version() {
+    grep "^${1}|" "$PKG_DB" 2>/dev/null | cut -d'|' -f2
+}
+
+# ── cmd: install ─────────────────────────────────────────────────────────────
+cmd_install() {
+    check_root
+    init_dirs
+
+    local auto_yes=false no_deps=false verbose=false
+    local real_pkgs=()
+
+    for arg in "$@"; do
+        case "$arg" in
+            -y|--yes)     auto_yes=true ;;
+            --no-deps)    no_deps=true  ;;
+            -v|--verbose) verbose=true  ;;
+            -*)           log_warn "Unknown flag: $arg" ;;
+            *)            real_pkgs+=("$arg") ;;
+        esac
+    done
+
+    [[ ${#real_pkgs[@]} -gt 0 ]] || die "No packages specified."
+    [[ -s "$PKG_INDEX"        ]] || die "Index is empty. Run 'arpkg update' first."
+
+    local visited=() order=()
+
+    for pkg in "${real_pkgs[@]}"; do
+        if is_installed "$pkg"; then
+            log_warn "${pkg} is already installed \
+($(get_installed_version "$pkg")). Skipping."
+            continue
+        fi
+        if [[ "$no_deps" == true ]]; then
+            order+=("$pkg")
+        else
+            resolve_deps "$pkg" visited order
+        fi
+    done
+
+    [[ ${#order[@]} -gt 0 ]] || { log_info "Nothing to install."; return 0; }
+
+    echo ""
+    echo -e "${BOLD}The following ${#order[@]} package(s) will be installed:${NC}"
+    for pkg in "${order[@]}"; do
+        local entry; entry=$(lookup_pkg "$pkg")
+        parse_index_line "$entry"
+        echo -e "  ${GREEN}+${NC} ${BOLD}${PKG_FIELD_NAME}${NC} ${PKG_FIELD_VER}"
+    done
+    echo ""
+
+    if [[ "$auto_yes" != true ]]; then
+        read -rp "Proceed? [Y/n] " confirm
+        [[ "$confirm" =~ ^[Nn]$ ]] && { log_info "Aborted."; exit 0; }
+    fi
+
+    for pkg in "${order[@]}"; do
+        _install_single "$pkg" "$verbose"
+    done
+
+    log_success "Done. ${#order[@]} package(s) installed."
+}
+
+_install_single() {
+    local pkg="$1" verbose="$2"
+    local entry; entry=$(lookup_pkg "$pkg") || die "Package '${pkg}' not found."
+    parse_index_line "$entry"
+
+    log_step "Installing ${BOLD}${PKG_FIELD_NAME}${NC} ${PKG_FIELD_VER}..."
+
+    local tarball="${PKG_CACHE}/downloads/${PKG_FIELD_NAME}-${PKG_FIELD_VER}.tar.gz"
+
+    # ── Download ──
+    log_step "  Downloading..."
+    curl -fL --progress-bar --connect-timeout 15 \
+        -o "$tarball" "$PKG_FIELD_URL" \
+        || die "Download failed for ${pkg}."
+
+    # ── Verify SHA-256 (Zero-Trust: no exceptions) ──
+    log_step "  Verifying SHA-256..."
+    local actual_sha; actual_sha=$(sha256sum "$tarball" | awk '{print $1}')
+
+    if [[ "$actual_sha" != "$PKG_FIELD_SHA" ]]; then
+        rm -f "$tarball"
+        die "SHA-256 MISMATCH — package discarded!\n" \
+            "  Expected: ${PKG_FIELD_SHA}\n" \
+            "  Got:      ${actual_sha}"
+    fi
+    log_success "  Checksum OK."
+
+    # ── Extract to root filesystem ──
+    log_step "  Extracting to /..."
+    if [[ "$verbose" == true ]]; then
+        tar -xzvf "$tarball" -C / 2>&1 | grep -v '^\./$' || die "Extraction failed."
+    else
+        tar -xzf "$tarball" -C / || die "Extraction failed for ${pkg}."
+    fi
+
+    # ── Register in DB ──
+    echo "${PKG_FIELD_NAME}|${PKG_FIELD_VER}|${PKG_FIELD_SHA}|\
+$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$PKG_DB"
+
+    log_success "  ${PKG_FIELD_NAME} ${PKG_FIELD_VER} installed."
+}
+
+# ── cmd: remove ──────────────────────────────────────────────────────────────
+cmd_remove() {
+    check_root
+    local auto_yes=false real_pkgs=()
+
+    for arg in "$@"; do
+        case "$arg" in
+            -y|--yes) auto_yes=true ;;
+            *)        real_pkgs+=("$arg") ;;
+        esac
+    done
+
+    [[ ${#real_pkgs[@]} -gt 0 ]] || die "No packages specified."
+
+    for pkg in "${real_pkgs[@]}"; do
+        is_installed "$pkg" || { log_warn "${pkg} is not installed."; continue; }
+
+        echo -e "${BOLD}Remove:${NC} ${RED}${pkg}${NC} \
+($(get_installed_version "$pkg"))"
+
+        if [[ "$auto_yes" != true ]]; then
+            read -rp "Proceed? [y/N] " confirm
+            [[ "$confirm" =~ ^[Yy]$ ]] || { log_info "Skipped."; continue; }
+        fi
+
+        # Remove files via tarball manifest
+        local ver; ver=$(get_installed_version "$pkg")
+        local tarball="${PKG_CACHE}/downloads/${pkg}-${ver}.tar.gz"
+
+        if [[ -f "$tarball" ]]; then
+            log_step "Removing files..."
+            tar -tzf "$tarball" | grep -v '/$' | while read -r f; do
+                rm -f "/${f}" 2>/dev/null || true
+            done
+        else
+            log_warn "Tarball not in cache — deregistering only."
+        fi
+
+        sed -i "/^${pkg}|/d" "$PKG_DB"
+        log_success "Removed ${pkg}."
+    done
+}
+
+# ── cmd: upgrade ─────────────────────────────────────────────────────────────
+cmd_upgrade() {
+    check_root
+    [[ -s "$PKG_DB" ]] || { log_info "No packages installed."; return 0; }
+
+    log_info "Checking for upgrades..."
+    local upgrades=()
+
+    while IFS='|' read -r name ver _sha _date; do
+        local entry; entry=$(lookup_pkg "$name") || continue
+        parse_index_line "$entry"
+        [[ "$PKG_FIELD_VER" != "$ver" ]] && upgrades+=("${name}|${ver}|${PKG_FIELD_VER}")
+    done < "$PKG_DB"
+
+    if [[ ${#upgrades[@]} -eq 0 ]]; then
+        log_success "All packages up to date."
+        return 0
+    fi
+
+    echo ""
+    echo -e "${BOLD}${#upgrades[@]} upgrade(s) available:${NC}"
+    for u in "${upgrades[@]}"; do
+        IFS='|' read -r n old new <<< "$u"
+        echo -e "  ${YELLOW}↑${NC} ${BOLD}${n}${NC}  ${old} → ${GREEN}${new}${NC}"
+    done
+    echo ""
+
+    read -rp "Proceed with upgrade? [Y/n] " confirm
+    [[ "$confirm" =~ ^[Nn]$ ]] && { log_info "Aborted."; exit 0; }
+
+    for u in "${upgrades[@]}"; do
+        local name; name=$(cut -d'|' -f1 <<< "$u")
+        sed -i "/^${name}|/d" "$PKG_DB"
+        _install_single "$name" "false"
+    done
+    log_success "Upgrade complete."
+}
+
+# ── cmd: search ──────────────────────────────────────────────────────────────
+cmd_search() {
+    local query="${1:-}"
+    [[ -n "$query" ]] || die "Usage: arpkg search <query>"
+    [[ -s "$PKG_INDEX" ]] || die "Index empty. Run 'arpkg update'."
+
+    echo ""
+    echo -e "${BOLD}Results for '${query}':${NC}"
+    echo ""
+
+    local found=0
+    while IFS='|' read -r name ver _sha _deps _url desc; do
+        if [[ "$name" =~ $query || "$desc" =~ $query ]]; then
+            local tag=""
+            is_installed "$name" && tag=" ${GREEN}[installed]${NC}"
+            printf "  ${BOLD}%-22s${NC} %-12s %s%b\n" \
+                "$name" "$ver" "$desc" "$tag"
+            found=$((found + 1))
+        fi
+    done < "$PKG_INDEX"
+
+    [[ $found -eq 0 ]] && log_warn "No results for '${query}'."
+    echo ""
+}
+
+# ── cmd: info ────────────────────────────────────────────────────────────────
+cmd_info() {
+    local pkg="${1:-}"; [[ -n "$pkg" ]] || die "Usage: arpkg info <package>"
+    local entry; entry=$(lookup_pkg "$pkg") || die "Package '${pkg}' not found."
+    parse_index_line "$entry"
+
+    echo ""
+    echo -e "${BOLD}┌─────────────────────────────────────────┐${NC}"
+    printf  "${BOLD}│${NC}  %-41s${BOLD}│${NC}\n" \
+        "${PKG_FIELD_NAME}  ${PKG_FIELD_VER}"
+    echo -e "${BOLD}└─────────────────────────────────────────┘${NC}"
+    echo ""
+    echo -e "  ${BOLD}Description:${NC}  ${PKG_FIELD_DESC}"
+    echo -e "  ${BOLD}Version:${NC}      ${PKG_FIELD_VER}"
+    echo -e "  ${BOLD}Dependencies:${NC} ${PKG_FIELD_DEPS:-none}"
+    echo -e "  ${BOLD}SHA-256:${NC}      ${PKG_FIELD_SHA}"
+    echo -e "  ${BOLD}Source:${NC}       ${PKG_FIELD_URL}"
+
+    if is_installed "$pkg"; then
+        echo -e "  ${BOLD}Status:${NC}       ${GREEN}● Installed${NC} ($(get_installed_version "$pkg"))"
+    else
+        echo -e "  ${BOLD}Status:${NC}       ○ Not installed"
+    fi
+    echo ""
+}
+
+# ── cmd: list ────────────────────────────────────────────────────────────────
+cmd_list() {
+    [[ -s "$PKG_DB" ]] || { log_info "No packages installed."; return 0; }
+    echo ""
+    echo -e "${BOLD}Installed packages:${NC}"
+    echo ""
+    printf "  ${BOLD}%-22s %-14s %-26s${NC}\n" "NAME" "VERSION" "INSTALLED AT"
+    printf "  %-22s %-14s %-26s\n"             "────" "───────" "────────────"
+    while IFS='|' read -r name ver _sha date; do
+        printf "  %-22s %-14s %-26s\n" "$name" "$ver" "$date"
+    done < "$PKG_DB"
+    echo ""
+}
+
+cmd_list_all() {
+    [[ -s "$PKG_INDEX" ]] || die "Index empty. Run 'arpkg update'."
+    echo ""
+    echo -e "${BOLD}Available packages:${NC}"
+    echo ""
+    printf "  ${BOLD}%-22s %-14s %s${NC}\n" "NAME" "VERSION" "DESCRIPTION"
+    printf "  %-22s %-14s %s\n"             "────" "───────" "───────────"
+    while IFS='|' read -r name ver _sha _deps _url desc; do
+        local tag=""; is_installed "$name" && tag=" [i]"
+        printf "  %-22s %-14s %s%s\n" "$name" "$ver" "$desc" "$tag"
+    done < "$PKG_INDEX"
+    echo ""
+}
+
+# ── cmd: verify ──────────────────────────────────────────────────────────────
+cmd_verify() {
+    local pkg="${1:-}"; [[ -n "$pkg" ]] || die "Usage: arpkg verify <package>"
+    is_installed "$pkg" || die "${pkg} is not installed."
+
+    local stored_sha; stored_sha=$(grep "^${pkg}|" "$PKG_DB" | cut -d'|' -f3)
+    local ver; ver=$(get_installed_version "$pkg")
+    local tarball="${PKG_CACHE}/downloads/${pkg}-${ver}.tar.gz"
+
+    [[ -f "$tarball" ]] || die "Cached tarball not found for ${pkg}."
+
+    local actual_sha; actual_sha=$(sha256sum "$tarball" | awk '{print $1}')
+
+    if [[ "$actual_sha" == "$stored_sha" ]]; then
+        log_success "${pkg} integrity verified (SHA-256 match)."
+    else
+        log_error "${pkg} INTEGRITY CHECK FAILED."
+        log_error "  Stored:  ${stored_sha}"
+        log_error "  Current: ${actual_sha}"
+        exit 1
+    fi
+}
+
+# ── cmd: deps (tree) ─────────────────────────────────────────────────────────
+cmd_deps() {
+    local pkg="${1:-}"; [[ -n "$pkg" ]] || die "Usage: arpkg deps <package>"
+    lookup_pkg "$pkg" >/dev/null || die "Package '${pkg}' not found."
+    echo ""
+    echo -e "${BOLD}Dependency tree for ${pkg}:${NC}"
+    echo ""
+    _deps_tree "$pkg" "" true
+    echo ""
+}
+
+_deps_tree() {
+    local pkg="$1" prefix="$2" last="$3"
+    local sym="├──"; [[ "$last" == true ]] && sym="└──"
+    local tag=""; is_installed "$pkg" && tag=" ${GREEN}✓${NC}"
+    echo -e "${prefix}${sym} ${BOLD}${pkg}${NC}${tag}"
+
+    local entry; entry=$(lookup_pkg "$pkg" 2>/dev/null) || return 0
+    parse_index_line "$entry"
+    [[ -z "$PKG_FIELD_DEPS" ]] && return 0
+
+    IFS=',' read -ra deps <<< "$PKG_FIELD_DEPS"
+    local i=0
+    for dep in "${deps[@]}"; do
+        dep="${dep// /}"; [[ -z "$dep" ]] && continue
+        i=$((i + 1))
+        local child_prefix="${prefix}│   "
+        local is_last=false
+        if [[ $i -eq ${#deps[@]} ]]; then
+            is_last=true; child_prefix="${prefix}    "
+        fi
+        _deps_tree "$dep" "$child_prefix" "$is_last"
+    done
+}
+
+# ── cmd: clean ───────────────────────────────────────────────────────────────
+cmd_clean() {
+    log_step "Clearing download cache..."
+    rm -rf "${PKG_CACHE}/downloads/"* "${PKG_CACHE}/extracted/"*
+    log_success "Cache cleared."
+}
+
+# ── cmd: yay (Arch Subsystem bridge) ─────────────────────────────────────────
+cmd_yay() {
+    local bridge="/usr/lib/arpkg/arch-subsystem/yay-bridge"
+    [[ -x "$bridge" ]] \
+        || die "Arch Subsystem not enabled. Enable it under Developer Options."
+    exec "$bridge" "$@"
+}
+
+# ── OS Detection ─────────────────────────────────────────────────────────────
+_os_id()   { grep "^ID="      /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "unknown"; }
+_os_like() { grep "^ID_LIKE=" /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo ""; }
+
+is_debian_based() {
+    local id; id=$(_os_id); local like; like=$(_os_like)
+    [[ "$id" == "debian" || "$id" == "ubuntu" || "$like" == *"debian"* || "$like" == *"ubuntu"* ]]
+}
+
+is_arch_based() {
+    local id; id=$(_os_id); local like; like=$(_os_like)
+    [[ "$id" == "arch" || "$like" == *"arch"* ]]
+}
+
+# ── Servant config helpers ────────────────────────────────────────────────────
+get_active_servant() {
+    [[ -f "$SERVANT_CONF" ]] \
+        && grep "^servant=" "$SERVANT_CONF" | cut -d= -f2 | tr -d '"' \
+        || echo ""
+}
+
+_save_servant() {
+    mkdir -p /etc/arpkg
+    echo "servant=${1}" > "$SERVANT_CONF"
+}
+
+# ── cmd: --servant add <name> ─────────────────────────────────────────────────
+cmd_servant() {
+    local sub="${1:-}"; shift || true
+    case "$sub" in
+        add) _servant_add "$@" ;;
+        *)   die "Unknown --servant subcommand: '${sub}'. Usage: arpkg --servant add <name>" ;;
+    esac
+}
+
+_servant_add() {
+    check_root
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "Usage: arpkg --servant add <name>  (e.g. apt, pacman, yay)"
+
+    local -a debian_servants=("apt")
+    local -a arch_servants=("pacman" "yay" "paru")
+
+    # ── OS compatibility gate ──
+    if printf '%s\n' "${debian_servants[@]}" | grep -qx "$name"; then
+        is_debian_based \
+            || die "[ ✗ ] Servant '${name}' is only available on Debian-based systems. Current OS: $(_os_id)"
+    elif printf '%s\n' "${arch_servants[@]}" | grep -qx "$name"; then
+        is_arch_based \
+            || die "[ ✗ ] Servant '${name}' is only available on Arch-based systems. Current OS: $(_os_id)"
+    else
+        log_warn "Unrecognised servant '${name}'. Registering anyway — no OS guard applied."
+    fi
+
+    # ── Binary presence check (shadow realm aware) ──
+    if [[ "$name" == "apt" ]] && [[ -x "$SHADOW_APT" ]]; then
+        log_info "Found apt via shadow realm path (Konix mode)."
+    elif ! command -v "$name" &>/dev/null; then
+        log_warn "'${name}' not found in PATH. Make sure it is installed before using it."
+    fi
+
+    _save_servant "$name"
+    log_success "Servant '${name}' registered and active."
+    log_info   "arpkg will delegate supported operations to '${name}'."
+}
+
+# ── cmd: --add --confirm <repo_url> ──────────────────────────────────────────
+cmd_add_repo() {
+    local confirmed=false repo_url=""
+
+    for arg in "$@"; do
+        case "$arg" in
+            --confirm) confirmed=true ;;
+            *)         [[ -z "$repo_url" ]] && repo_url="$arg" ;;
+        esac
+    done
+
+    # ── Vibe check gate ──
+    if [[ "$confirmed" != true ]]; then
+        echo -e "${RED}[ 🛑 VIBE CHECK FAILED ]${NC} Bro, this repo is unverified."
+        echo -e "  Use ${BOLD}--confirm${NC} to acknowledge you might brick your OS."
+        echo -e "  Example: ${CYAN}arpkg --add --confirm ${repo_url:-<REPO_URL>}${NC}"
+        exit 1
+    fi
+
+    [[ -n "$repo_url" ]] || die "No repo URL provided. Usage: arpkg --add --confirm <REPO_URL>"
+
+    local servant; servant=$(get_active_servant)
+    [[ -n "$servant" ]] \
+        || die "No servant configured. Run 'arpkg --servant add <name>' first."
+
+    check_root
+
+    case "$servant" in
+        apt)
+            local dest="/etc/apt/sources.list"
+            log_info "Adding repo to ${dest}..."
+            echo "deb ${repo_url}" >> "$dest"
+            log_success "Repo appended to ${dest}."
+            log_info   "Run your apt update to sync the new repo."
+            ;;
+        pacman|yay|paru)
+            local dest="/etc/pacman.conf"
+            log_info "Appending custom repo section to ${dest}..."
+            printf '\n[arpkg-custom]\nServer = %s\n' "$repo_url" >> "$dest"
+            log_success "Repo appended to ${dest}."
+            log_info   "Run 'pacman -Sy' to sync."
+            ;;
+        *)
+            die "Don't know how to add repos for servant '${servant}'."
+            ;;
+    esac
+}
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+main() {
+    [[ $# -eq 0 ]] && { usage; exit 0; }
+    local cmd="$1"; shift
+
+    case "$cmd" in
+        install)    cmd_install  "$@"  ;;
+        remove)     cmd_remove   "$@"  ;;
+        update)     cmd_update         ;;
+        upgrade)    cmd_upgrade        ;;
+        search)     cmd_search   "$@"  ;;
+        info)       cmd_info     "$@"  ;;
+        list)       cmd_list           ;;
+        list-all)   cmd_list_all       ;;
+        deps)       cmd_deps     "$@"  ;;
+        verify)     cmd_verify   "$@"  ;;
+        clean)      cmd_clean          ;;
+        yay)        cmd_yay      "$@"  ;;
+        --servant)  cmd_servant  "$@"  ;;
+        --add)      cmd_add_repo "$@"  ;;
+        --version)  echo "arpkg ${ARPKG_VERSION}"; exit 0 ;;
+        -h|--help)  usage; exit 0     ;;
+        *)  log_error "Unknown command: ${cmd}"; usage; exit 1 ;;
+    esac
+}
+
+main "$@"

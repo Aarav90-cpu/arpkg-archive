@@ -1,0 +1,61 @@
+# ARKBUILD — chromium
+# Open-source Chromium browser compiled from source against musl.
+# Custom flags enable Google account sync, matching the full Chrome experience.
+# NOTE: This is the longest build in ARK OS (~4-6 hrs, requires ≥16GB RAM).
+PKG_NAME="chromium"
+PKG_VERSION="126.0.6478.182"
+SOURCE_URL="https://chromium.googlesource.com/chromium/src.git"
+DEPENDENCIES="musl openssl gtk4 pipewire"
+
+build() {
+    # Fetch via depot_tools (the only supported method for Chromium)
+    git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+    export PATH="$PWD/depot_tools:$PATH"
+    # Fetch Chromium source at pinned version
+    mkdir chromium-src && cd chromium-src
+    fetch --nohooks --no-history chromium
+    cd src
+    git checkout "$PKG_VERSION"
+    gclient sync --no-history --nohooks
+    gclient runhooks
+    # ARK OS build args: musl-compatible, Google sync enabled, minimal
+    mkdir -p out/Release
+    cat > out/Release/args.gn << 'GN'
+is_official_build = true
+is_clang = true
+use_musl = true
+use_sysroot = false
+target_cpu = "x64"
+enable_nacl = false
+enable_widevine = false
+use_cups = false
+use_gtk = true
+ozone_platform_wayland = true
+ozone_platform_x11 = false
+use_system_harfbuzz = false
+google_api_key = ""
+google_default_client_id = ""
+google_default_client_secret = ""
+enable_google_now = true
+safe_browsing_mode = 1
+GN
+    gn gen out/Release
+    autoninja -C out/Release chrome chrome_sandbox
+    # Install
+    install -Dm755 out/Release/chrome          "$PKG_ROOT/usr/lib/chromium/chromium"
+    install -Dm4755 out/Release/chrome_sandbox "$PKG_ROOT/usr/lib/chromium/chrome-sandbox"
+    install -Dm644 out/Release/*.pak           "$PKG_ROOT/usr/lib/chromium/"
+    install -Dm644 out/Release/*.bin           "$PKG_ROOT/usr/lib/chromium/" 2>/dev/null || true
+    install -Dm644 out/Release/icudtl.dat      "$PKG_ROOT/usr/lib/chromium/"
+    # Wrapper script
+    mkdir -p "$PKG_ROOT/usr/bin"
+    cat > "$PKG_ROOT/usr/bin/chromium" << 'WRAPPER'
+#!/bin/sh
+exec /usr/lib/chromium/chromium \
+    --ozone-platform=wayland \
+    --enable-features=WaylandWindowDecorations \
+    --disable-gpu-sandbox \
+    "$@"
+WRAPPER
+    chmod +x "$PKG_ROOT/usr/bin/chromium"
+}

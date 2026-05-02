@@ -1,0 +1,50 @@
+# ARKBUILD — linux-zen
+# Custom linux-zen kernel for ARK OS. Compiled with:
+#   - Full preemption (PREEMPT patch) for desktop responsiveness
+#   - Android binder + ashmem IPC (required by Waydroid/LXC)
+#   - schedutil governor as default
+PKG_NAME="linux-zen"
+PKG_VERSION="6.9.9"
+SOURCE_URL="https://github.com/zen-kernel/zen-kernel.git"
+DEPENDENCIES=""
+
+build() {
+    git clone --depth 1 --branch "v${PKG_VERSION}-zen1" "$SOURCE_URL" linux-zen
+    cd linux-zen
+    # Start from a clean defconfig
+    make x86_64_defconfig
+    # ARK OS kernel options
+    scripts/config \
+        --enable  CONFIG_PREEMPT \
+        --disable CONFIG_PREEMPT_NONE \
+        --disable CONFIG_PREEMPT_VOLUNTARY \
+        --enable  CONFIG_HZ_1000 \
+        --disable CONFIG_HZ_250 \
+        --enable  CONFIG_ANDROID_BINDER_IPC \
+        --enable  CONFIG_ANDROID_BINDERFS \
+        --enable  CONFIG_ASHMEM \
+        --enable  CONFIG_CGROUPS \
+        --enable  CONFIG_CGROUP_SCHED \
+        --enable  CONFIG_BLK_CGROUP \
+        --enable  CONFIG_NAMESPACES \
+        --enable  CONFIG_NET_NS \
+        --enable  CONFIG_PID_NS \
+        --enable  CONFIG_IPC_NS \
+        --enable  CONFIG_UTS_NS \
+        --enable  CONFIG_CPUFREQ_GOV_SCHEDUTIL \
+        --enable  CONFIG_CPUFREQ_GOV_PERFORMANCE \
+        --enable  CONFIG_CPUFREQ_GOV_POWERSAVE \
+        --enable  CONFIG_DRM \
+        --enable  CONFIG_DRM_I915 \
+        --enable  CONFIG_DRM_AMDGPU \
+        --enable  CONFIG_DRM_NOUVEAU \
+        --module  CONFIG_INPUT_EVDEV \
+        --enable  CONFIG_ACPI \
+        --enable  CONFIG_ACPI_BUTTON
+    make olddefconfig
+    make -j$(nproc)
+    # Install kernel, modules, headers
+    make INSTALL_PATH="$PKG_ROOT/boot"    install
+    make INSTALL_MOD_PATH="$PKG_ROOT"     modules_install
+    make INSTALL_HDR_PATH="$PKG_ROOT/usr" headers_install
+}
