@@ -1,8 +1,7 @@
 # How to Contribute to arpkg
 
 ## What is this?
-This is the official package repository for **arpkg**, the native package manager for ARK OS. 
-*(Note: This project is currently in Alpha. ARK OS is not yet released for general production.)*
+This is the official package repository for **arpkg**, a package manager.
 
 ## The Golden Rule: No Binaries
 **DO NOT submit `.tar.gz` files or pre-compiled binaries.** To maintain a zero-trust, zero-bloat ecosystem, ARK OS compiles all packages from source on our secure CI/CD servers. Any Pull Request containing a pre-compiled binary will be immediately closed.
@@ -10,7 +9,7 @@ This is the official package repository for **arpkg**, the native package manage
 ## Requirements for Submission
 To submit a package to ARK OS, you must create a directory with your package name and include a single configuration file called `ARKBUILD`.
 
-> Note: Make sure the `ARKBUILD` does not contain wget commands!
+> Note: Make sure the `ARKBUILD` does not contain wget commands! Use curl instead!
 
 ### 1. Directory Structure
 Fork this repository and create your package under the appropriate category:
