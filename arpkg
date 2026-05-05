@@ -3,6 +3,8 @@
 #  arpkg — ARK OS Package Manager
 #  Zero-trust, source-compiled, SHA-256 verified package management.
 #  Part of the ARK OS project.
+#
+#  Contributing: https://github.com/Aarav90-cpu/arpkg-archive/blob/master/CONTRIBUTING.md
 # =============================================================================
 
 set -euo pipefail
@@ -14,16 +16,22 @@ PKG_CACHE="/var/cache/arpkg"
 PKG_INDEX="/var/lib/arpkg/index.db"
 SERVANT_CONF="/etc/arpkg/servant.conf"
 SHADOW_APT="/usr/lib/arpkg/shadow_realm/backend_apt_do_not_touch"
+ARPKG_GITHUB_REPO="Aarav90-cpu/arpkg-archive"
+SELF_RELEASE_FILE="/var/lib/arpkg/release.tag"
+ARCHIVE_CLONE_DIR="${PKG_CACHE}/arpkg-archive-src"
+CONTRIBUTING_URL="https://github.com/${ARPKG_GITHUB_REPO}/blob/master/CONTRIBUTING.md"
 
-# ── Colors ──────────────────────────────────────────────────────────────────
+# Colors
 RED='\033[0;31m';  GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m';  BOLD='\033[1m'; NC='\033[0m'
+MAGENTA='\033[0;35m'
 
 log_info()    { echo -e "${BLUE}[arpkg]${NC} $*"; }
 log_success() { echo -e "${GREEN}[✓]${NC} $*"; }
 log_warn()    { echo -e "${YELLOW}[!]${NC} $*"; }
 log_error()   { echo -e "${RED}[✗]${NC} $*" >&2; }
 log_step()    { echo -e "${CYAN}[→]${NC} $*"; }
+log_build()   { echo -e "${MAGENTA}[⚙]${NC} $*"; }
 die()         { log_error "$*"; exit 1; }
 
 usage() {
@@ -36,7 +44,7 @@ ${BOLD}USAGE:${NC}
 ${BOLD}COMMANDS:${NC}
   install  <pkg>   Install one or more packages (resolves dependencies)
   remove   <pkg>   Remove an installed package
-  update           Sync package index from all configured sources
+  update           Sync arpkg index (git clone master) + sync all servants
   upgrade          Upgrade all outdated installed packages
   search   <query> Search for packages by name or description
   info     <pkg>   Show detailed package information
@@ -46,49 +54,57 @@ ${BOLD}COMMANDS:${NC}
   verify   <pkg>   Re-verify the SHA-256 integrity of an installed package
   clean            Clear the package download cache
   yay      <pkg>   Install via the Arch Subsystem (Developer Options only)
+  self-update      Update arpkg itself from GitHub releases (tags: 1, 2, 3...)
 
 ${BOLD}SERVANT COMMANDS:${NC}
-  --servant add <name>            Register a backend servant (apt, pacman, yay)
-                                  apt   — Debian/Ubuntu-based systems only
-                                  pacman/yay — Arch-based systems only
-  --add --confirm <repo_url>      Add a third-party repo to the active servant's
-                                  sources (--confirm required to acknowledge risk)
+  --servant add <name>            Register a backend servant. Supported:
+                                    Debian/Ubuntu : apt
+                                    Arch          : pacman, yay, paru
+                                    Universal     : flatpak, snapd
+                                    RPM           : dnf, zypper
+  --servant list                  List all registered servants
+  --add --confirm <repo_url>      Add a third-party repo to the primary
+                                  servant's sources (--confirm required)
 
 ${BOLD}OPTIONS:${NC}
   -y, --yes        Skip all confirmation prompts
-  -v, --verbose    Verbose tar extraction output
+  -v, --verbose    Verbose build/extraction output
   --no-deps        Install package without resolving dependencies
   -h, --help       Print this help message
   --version        Print arpkg version
 
+${BOLD}CONTRIBUTING:${NC}
+  ${CONTRIBUTING_URL}
+  Packages are built from source via ARKBUILD files — no binaries accepted.
+
 EOF
 }
 
-# ── Privilege check ──────────────────────────────────────────────────────────
+# Privilege check
 check_root() {
     [[ $EUID -eq 0 ]] && return 0
     if command -v sudo &>/dev/null; then
         die "arpkg requires root privileges. Use: sudo arpkg ..."
     else
-        # sudo not installed — skip the hard requirement
         log_warn "arpkg requires root privileges, but sudo is not installed — proceeding without privilege check."
     fi
 }
 
-# ── Bootstrap directory structure ────────────────────────────────────────────
+# Bootstrap directory structure
 init_dirs() {
     mkdir -p \
         /etc/arpkg \
         /var/lib/arpkg \
         /var/cache/arpkg/downloads \
-        /var/cache/arpkg/extracted
+        /var/cache/arpkg/extracted \
+        /var/cache/arpkg/build \
+        "${ARCHIVE_CLONE_DIR}"
 
     if [[ ! -f "$SOURCES_LIST" ]]; then
         cat > "$SOURCES_LIST" <<'SOURCES'
 # ARK OS Package Sources
-# Format: ark <base_url> <branch>
-ark https://raw.githubusercontent.com/Aarav90-cpu/arpkg-archive/master core
-ark https://raw.githubusercontent.com/Aarav90-cpu/arpkg-archive/master community
+# Format: ark <github_repo> <branch>
+ark Aarav90-cpu/arpkg-archive master
 SOURCES
     fi
 
@@ -96,8 +112,8 @@ SOURCES
     [[ -f "$PKG_INDEX" ]] || touch "$PKG_INDEX"
 }
 
-# ── Index field parser ───────────────────────────────────────────────────────
-# Index line format: name|version|sha256|deps|url|description
+# Index field parser
+# Index line format: name|version|sha256|deps|source_url|description
 parse_index_line() {
     local line="$1"
     PKG_FIELD_NAME=$(cut -d'|' -f1 <<< "$line")
@@ -113,40 +129,118 @@ lookup_pkg() {
     grep "^${pkg}|" "$PKG_INDEX" 2>/dev/null | head -1
 }
 
-# ── cmd: update ─────────────────────────────────────────────────────────────
+# cmd: update
+# Clones the arpkg-archive master branch to build the local index from
+# ARKBUILD files, then also syncs every registered servant.
 cmd_update() {
+    check_root
     init_dirs
-    log_info "Syncing package index..."
-    [[ -f "$SOURCES_LIST" ]] || die "No sources list at $SOURCES_LIST"
+    command -v git &>/dev/null || die "git is required for arpkg update. Install git first."
 
+    echo ""
+    echo -e "${BOLD}  ┌──────────────────────────────────────────────┐${NC}"
+    echo -e "  ${BOLD}│${NC}  🔄 arpkg update                               ${BOLD}│${NC}"
+    echo -e "${BOLD}  └──────────────────────────────────────────────┘${NC}"
+    echo ""
+
+    # Clone / refresh arpkg-archive master
+    log_step "Cloning arpkg-archive (master branch)..."
+    local repo_url="https://github.com/${ARPKG_GITHUB_REPO}.git"
+
+    if [[ -d "${ARCHIVE_CLONE_DIR}/.git" ]]; then
+        log_info "Refreshing existing clone..."
+        git -C "$ARCHIVE_CLONE_DIR" fetch --depth 1 origin master 2>&1 | \
+            grep -v "^$" | sed 's/^/  /' || true
+        git -C "$ARCHIVE_CLONE_DIR" reset --hard origin/master 2>&1 | \
+            grep -v "^$" | sed 's/^/  /' || true
+    else
+        rm -rf "$ARCHIVE_CLONE_DIR"
+        git clone --depth 1 --branch master "$repo_url" "$ARCHIVE_CLONE_DIR" 2>&1 | \
+            grep -v "^$" | sed 's/^/  /' \
+            || die "Failed to clone ${repo_url}. Check your internet connection."
+    fi
+    log_success "Archive cloned at: ${ARCHIVE_CLONE_DIR}"
+    echo ""
+
+    # Build index from ARKBUILD files
+    log_step "Building package index from ARKBUILD files..."
     > "${PKG_INDEX}.tmp"
+    local pkg_count=0
 
-    while IFS= read -r line; do
-        [[ "$line" =~ ^#|^$ ]] && continue
-        local type url branch
-        read -r type url branch <<< "$line"
-        local index_url="${url}/releases/download/index/${branch}.index"
-        log_step "Fetching ${branch} from ${url}..."
-        if curl -fsSL --connect-timeout 10 --max-time 30 \
-               "$index_url" >> "${PKG_INDEX}.tmp" 2>/dev/null; then
-            log_success "Synced: ${branch}"
-        else
-            log_warn "Unreachable: ${url} — skipping"
+    while IFS= read -r -d '' arkbuild_path; do
+        [[ -f "$arkbuild_path" ]] || continue
+
+        local pkg_name="" pkg_ver="" src_url="" deps="" desc=""
+        pkg_name=$(grep -m1 '^PKG_NAME='    "$arkbuild_path" | cut -d= -f2- | tr -d '"' || true)
+        pkg_ver=$(grep  -m1 '^PKG_VERSION=' "$arkbuild_path" | cut -d= -f2- | tr -d '"' || true)
+        src_url=$(grep  -m1 '^SOURCE_URL='  "$arkbuild_path" | cut -d= -f2- | tr -d '"' || true)
+        deps=$(grep     -m1 '^DEPENDENCIES=' "$arkbuild_path" | cut -d= -f2- | tr -d '"' || true)
+
+        local pkginfo_path
+        pkginfo_path="$(dirname "$arkbuild_path")/pkginfo.json"
+        if [[ -f "$pkginfo_path" ]] && command -v python3 &>/dev/null; then
+            desc=$(python3 -c \
+                "import json; d=json.load(open('${pkginfo_path}')); print(d.get('description',''))" \
+                2>/dev/null || true)
         fi
-    done < "$SOURCES_LIST"
+        [[ -z "$desc" ]] && desc="$(basename "$(dirname "$arkbuild_path")")"
+
+        [[ -z "$pkg_name" ]] && continue
+        [[ -z "$pkg_ver"  ]] && pkg_ver="unknown"
+
+        # sha256 is empty for source-built packages
+        echo "${pkg_name}|${pkg_ver}||${deps}|${src_url}|${desc}" >> "${PKG_INDEX}.tmp"
+        pkg_count=$(( pkg_count + 1 ))
+    done < <(find "${ARCHIVE_CLONE_DIR}" -name "ARKBUILD" -print0 2>/dev/null)
 
     mv "${PKG_INDEX}.tmp" "$PKG_INDEX"
-    local count; count=$(wc -l < "$PKG_INDEX")
-    log_success "Index updated. ${count} packages available."
+    log_success "Index built: ${pkg_count} packages from ARKBUILD files."
+    echo ""
+
+    # Sync each registered servant
+    _sync_all_servants
 }
 
-# ── Dependency resolution (DFS topological sort) ─────────────────────────────
+# Update every registered servant's package lists
+_sync_all_servants() {
+    local servants=()
+    mapfile -t servants < <(get_all_servants)
+    [[ ${#servants[@]} -eq 0 ]] && return 0
+
+    echo -e "${BOLD}  [ 🤝 ] Syncing servant package databases...${NC}"
+    echo ""
+
+    local apt_bin="apt"
+    for sv in "${servants[@]}"; do
+        [[ -z "$sv" ]] && continue
+        [[ "$sv" == "apt" && -x "$SHADOW_APT" ]] && apt_bin="$SHADOW_APT"
+        printf "  ${CYAN}[→]${NC} Syncing ${BOLD}%s${NC}...\n" "$sv"
+        local ec=0
+        case "$sv" in
+            apt)         "$apt_bin" update -qq 2>&1 | tail -2 | sed 's/^/    /'            || ec=$? ;;
+            pacman)      pacman -Sy --noconfirm 2>&1 | tail -3 | sed 's/^/    /'           || ec=$? ;;
+            yay|paru)    "$sv" -Sy 2>&1 | tail -3 | sed 's/^/    /'                        || ec=$? ;;
+            flatpak)     flatpak update --assumeyes 2>&1 | tail -3 | sed 's/^/    /'       || ec=$? ;;
+            snapd|snap)  snap refresh 2>&1 | tail -3 | sed 's/^/    /'                     || ec=$? ;;
+            dnf)         dnf check-update -q 2>&1 | tail -3 | sed 's/^/    /'             || ec=$? ;;
+            zypper)      zypper refresh -q 2>&1 | tail -3 | sed 's/^/    /'               || ec=$? ;;
+            *)           log_warn "    No sync command known for servant '${sv}'. Skipping." ;;
+        esac
+        if [[ $ec -eq 0 ]]; then
+            log_success "  ${sv} synced."
+        else
+            log_warn    "  ${sv} sync exited ${ec} (may be normal if nothing changed)."
+        fi
+    done
+    echo ""
+}
+
+# Dependency resolution (DFS topological sort)
 resolve_deps() {
     local pkg="$1"
     local -n _vis=$2
     local -n _ord=$3
 
-    # Already processed this node
     [[ " ${_vis[*]} " =~ " ${pkg} " ]] && return 0
     _vis+=("$pkg")
 
@@ -167,7 +261,7 @@ resolve_deps() {
     _ord+=("$pkg")
 }
 
-# ── Installed DB helpers ─────────────────────────────────────────────────────
+# Installed DB helpers
 is_installed() {
     grep -q "^${1}|" "$PKG_DB" 2>/dev/null
 }
@@ -176,7 +270,7 @@ get_installed_version() {
     grep "^${1}|" "$PKG_DB" 2>/dev/null | cut -d'|' -f2
 }
 
-# ── Install helpers ──────────────────────────────────────────────────────────
+# Install helpers
 
 # Fetch download size in bytes via HTTP HEAD (returns 0 on failure)
 _get_pkg_size() {
@@ -187,7 +281,7 @@ _get_pkg_size() {
     printf '%s' "${sz:-0}"
 }
 
-# Format raw bytes → human-readable string
+# Format raw bytes to human-readable string
 _format_size() {
     local bytes="${1:-0}"
     if [[ "$bytes" -le 0 ]]; then printf '?'; return; fi
@@ -209,12 +303,71 @@ _draw_progress_bar() {
     local empty=$(( width - filled ))
     local bar="" i
     for ((i=0; i<filled; i++)); do bar+="█"; done
-    for ((i=0; i<empty; i++)); do bar+="░"; done
+    for ((i=0; i<empty;  i++)); do bar+="░"; done
     printf "  ${BOLD}TOTAL${NC}  [${CYAN}%s${NC}] %3d%%  %s / %s  " \
         "$bar" "$pct" "$(_format_size "$current")" "$(_format_size "$total")"
 }
 
-# Delegate a package list to the active servant, printing rich status
+# Servant: query which servants can provide a package
+# Prints one line per match: "servant_name|version|size_bytes"
+_servant_search_pkg() {
+    local pkg="$1"
+    local servants=()
+    mapfile -t servants < <(get_all_servants)
+    local apt_bin="apt"
+
+    for sv in "${servants[@]}"; do
+        [[ -z "$sv" ]] && continue
+        [[ "$sv" == "apt" && -x "$SHADOW_APT" ]] && apt_bin="$SHADOW_APT"
+        local ver="" sz=0
+        case "$sv" in
+            apt)
+                ver=$(LC_ALL=C "$apt_bin" show "$pkg" 2>/dev/null \
+                    | grep -m1 '^Version:' | awk '{print $2}' || true)
+                sz=$(LC_ALL=C "$apt_bin" show "$pkg" 2>/dev/null \
+                    | grep -m1 '^Size:' | awk '{print $2}' || echo 0)
+                [[ -n "$ver" ]] && printf '%s|%s|%s\n' "$sv" "${ver:-?}" "${sz:-0}"
+                ;;
+            pacman)
+                ver=$(pacman -Si "$pkg" 2>/dev/null \
+                    | grep -m1 '^Version' | awk '{print $3}' || true)
+                sz=$(pacman -Si "$pkg" 2>/dev/null \
+                    | grep -m1 'Download Size' | awk '{print $4}' || echo 0)
+                [[ -n "$ver" ]] && printf '%s|%s|%s\n' "$sv" "${ver:-?}" "${sz:-0}"
+                ;;
+            yay|paru)
+                ver=$("$sv" -Si "$pkg" 2>/dev/null \
+                    | grep -m1 '^Version' | awk '{print $3}' || true)
+                [[ -n "$ver" ]] && printf '%s|%s|0\n' "$sv" "${ver:-?}"
+                ;;
+            flatpak)
+                ver=$(flatpak search --columns=version "$pkg" 2>/dev/null \
+                    | awk 'NR>1 {print $1; exit}' || true)
+                [[ -n "$ver" && "$ver" != "Version" ]] \
+                    && printf '%s|%s|0\n' "$sv" "${ver:-?}"
+                ;;
+            snapd|snap)
+                ver=$(snap find "$pkg" 2>/dev/null \
+                    | awk "NR>1 && \$1==\"${pkg}\" {print \$2; exit}" || true)
+                [[ -n "$ver" ]] && printf '%s|%s|0\n' "$sv" "${ver:-?}"
+                ;;
+            dnf)
+                ver=$(dnf info "$pkg" 2>/dev/null \
+                    | grep -m1 '^Version' | awk '{print $3}' || true)
+                sz=$(dnf info "$pkg" 2>/dev/null \
+                    | grep -m1 'Size' | awk '{print $3}' || echo 0)
+                [[ -n "$ver" ]] && printf '%s|%s|%s\n' "$sv" "${ver:-?}" "${sz:-0}"
+                ;;
+            zypper)
+                ver=$(zypper info "$pkg" 2>/dev/null \
+                    | grep -m1 '^Version' | awk '{print $3}' || true)
+                [[ -n "$ver" ]] && printf '%s|%s|0\n' "$sv" "${ver:-?}"
+                ;;
+        esac
+    done
+}
+
+# Delegate a package list to a specific servant, printing rich status
 _servant_install() {
     local servant="$1"; shift
     local pkgs=("$@")
@@ -232,10 +385,14 @@ _servant_install() {
 
     local exit_code=0
     case "$servant" in
-        apt)    "$apt_bin" install -y "${pkgs[@]}"     || exit_code=$? ;;
-        pacman) pacman -S --noconfirm "${pkgs[@]}"     || exit_code=$? ;;
-        yay|paru) "$servant" -S --noconfirm "${pkgs[@]}" || exit_code=$? ;;
-        *)        "$servant" install "${pkgs[@]}"      || exit_code=$? ;;
+        apt)         "$apt_bin" install -y "${pkgs[@]}"        || exit_code=$? ;;
+        pacman)      pacman -S --noconfirm "${pkgs[@]}"        || exit_code=$? ;;
+        yay|paru)    "$servant" -S --noconfirm "${pkgs[@]}"    || exit_code=$? ;;
+        flatpak)     flatpak install --assumeyes "${pkgs[@]}"  || exit_code=$? ;;
+        snapd|snap)  snap install "${pkgs[@]}"                 || exit_code=$? ;;
+        dnf)         dnf install -y "${pkgs[@]}"               || exit_code=$? ;;
+        zypper)      zypper install -y "${pkgs[@]}"            || exit_code=$? ;;
+        *)           "$servant" install "${pkgs[@]}"           || exit_code=$? ;;
     esac
 
     echo ""
@@ -247,50 +404,142 @@ _servant_install() {
     return $exit_code
 }
 
-# Verify SHA-256, print status, extract, detect kernel rebuild, register in DB.
-# Assumes tarball is already present in PKG_CACHE/downloads/.
+# ARKBUILD-based source build
+# Clones the package source repo and builds it from scratch per CONTRIBUTING.md
+_build_from_arkbuild() {
+    local pkg="$1" verbose="$2"
+    local entry; entry=$(lookup_pkg "$pkg") || die "Package '${pkg}' not found."
+    parse_index_line "$entry"
+
+    local arkbuild_path="${ARCHIVE_CLONE_DIR}/core/${pkg}/ARKBUILD"
+    [[ -f "$arkbuild_path" ]] || \
+        arkbuild_path="${ARCHIVE_CLONE_DIR}/community/${pkg}/ARKBUILD"
+    [[ -f "$arkbuild_path" ]] || \
+        die "ARKBUILD not found for '${pkg}'. Run 'arpkg update' first."
+
+    local build_src_url="" build_pkg_ver=""
+    build_src_url=$(grep -m1 '^SOURCE_URL='  "$arkbuild_path" | cut -d= -f2- | tr -d '"' || true)
+    build_pkg_ver=$(grep -m1 '^PKG_VERSION=' "$arkbuild_path" | cut -d= -f2- | tr -d '"' || true)
+
+    [[ -n "$build_src_url" ]] || die "No SOURCE_URL in ARKBUILD for '${pkg}'."
+    [[ -n "$build_pkg_ver" ]] || build_pkg_ver="$PKG_FIELD_VER"
+
+    command -v git &>/dev/null || die "git is required to build '${pkg}' from source."
+
+    local build_dir="/var/cache/arpkg/build/${pkg}"
+    rm -rf "$build_dir"
+    mkdir -p "$build_dir"
+
+    echo ""
+    echo -e "  ${MAGENTA}[ ✨ Vibe-checking dependencies... ]${NC}"
+    log_build "  Cloning source for ${BOLD}${pkg}${NC} ${build_pkg_ver}..."
+    echo -e "  ${CYAN}Source:${NC} ${build_src_url}"
+    echo ""
+
+    # Try versioned tag first (v$VER), then bare tag, then HEAD
+    if git clone --depth 1 --branch "v${build_pkg_ver}" \
+            "$build_src_url" "${build_dir}/src" 2>/dev/null; then
+        log_success "  Cloned at tag v${build_pkg_ver}."
+    elif git clone --depth 1 --branch "${build_pkg_ver}" \
+            "$build_src_url" "${build_dir}/src" 2>/dev/null; then
+        log_success "  Cloned at tag ${build_pkg_ver}."
+    else
+        log_warn "  No version tag found — cloning HEAD."
+        git clone --depth 1 "$build_src_url" "${build_dir}/src" \
+            || die "git clone failed for ${pkg} (${build_src_url})."
+    fi
+
+    # Kernel rebuild detection
+    if [[ "$pkg" =~ ^linux|^kernel ]]; then
+        echo ""
+        echo -e "  ${YELLOW}[ 🔧 Rebuilding kernel... ]${NC}  Please wait, this may take a moment."
+        [[ -x /usr/lib/arpkg/hooks/post-kernel-install ]] && \
+            /usr/lib/arpkg/hooks/post-kernel-install "$pkg" "$build_pkg_ver"
+        echo ""
+    fi
+
+    # Run compile() from ARKBUILD
+    local pkg_root="${build_dir}/pkg_root"
+    mkdir -p "$pkg_root"
+
+    log_build "  Building ${BOLD}${pkg}${NC}..."
+    echo ""
+
+    (
+        set -euo pipefail
+        PKG_ROOT="$pkg_root"
+        export PKG_ROOT
+        cd "${build_dir}/src"
+        # Source only the compile() function from ARKBUILD
+        _compile_src=$(grep -A 50 '^compile()' "$arkbuild_path" 2>/dev/null | head -50 || true)
+        eval "$_compile_src"
+        if declare -f compile &>/dev/null; then
+            if [[ "$verbose" == true ]]; then
+                compile
+            else
+                compile 2>&1 | tail -5 | sed 's/^/    /'
+            fi
+        else
+            log_warn "No compile() function found in ARKBUILD — raw source clone only."
+        fi
+    ) || die "Build failed for '${pkg}'. Run with -v for full output."
+
+    log_success "  Build complete."
+    echo ""
+
+    # Install pkg_root contents to /
+    echo -e "  ${CYAN}[ ⚙ ]${NC} Installing (${BOLD}${pkg}${NC} ${build_pkg_ver})..."
+    if [[ -d "$pkg_root" && "$(ls -A "$pkg_root" 2>/dev/null)" ]]; then
+        cp -a "${pkg_root}/." /
+    else
+        log_warn "  pkg_root is empty — package may install via its own Makefile."
+    fi
+
+    # Register in DB (sha256 not applicable for source builds)
+    echo "${pkg}|${build_pkg_ver}|source-build|$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$PKG_DB"
+    log_success "  ${pkg} ${build_pkg_ver} ✓  (built from source)"
+}
+
+# Verify SHA-256, extract tarball, detect kernel rebuild, register in DB.
+# Used as fallback when a pre-built tarball URL is present in the index.
 _verify_and_extract() {
     local pkg="$1" verbose="$2"
     local entry; entry=$(lookup_pkg "$pkg") || die "Package '${pkg}' not found."
     parse_index_line "$entry"
     local tarball="${PKG_CACHE}/downloads/${PKG_FIELD_NAME}-${PKG_FIELD_VER}.tar.gz"
 
-    # ── Verify SHA-256 (Zero-Trust: no exceptions) ──
-    log_step "  Verifying ${BOLD}${PKG_FIELD_NAME}${NC}..."
-    local actual_sha; actual_sha=$(sha256sum "$tarball" | awk '{print $1}')
-    if [[ "$actual_sha" != "$PKG_FIELD_SHA" ]]; then
-        rm -f "$tarball"
-        die "SHA-256 MISMATCH — ${pkg} discarded!\n  Expected: ${PKG_FIELD_SHA}\n  Got: ${actual_sha}"
+    if [[ -n "$PKG_FIELD_SHA" && "$PKG_FIELD_SHA" != "source-build" ]]; then
+        log_step "  Verifying ${BOLD}${PKG_FIELD_NAME}${NC}..."
+        local actual_sha; actual_sha=$(sha256sum "$tarball" | awk '{print $1}')
+        if [[ "$actual_sha" != "$PKG_FIELD_SHA" ]]; then
+            rm -f "$tarball"
+            die "SHA-256 MISMATCH — ${pkg} discarded!\n  Expected: ${PKG_FIELD_SHA}\n  Got: ${actual_sha}"
+        fi
+        log_success "  Checksum OK."
     fi
-    log_success "  Checksum OK."
 
-    # ── Installing status ──
     echo -e "  ${CYAN}[ ⚙ ]${NC} Installing (${BOLD}${PKG_FIELD_NAME}${NC} ${PKG_FIELD_VER})..."
 
-    # ── Kernel rebuild detection ──
+    # Kernel rebuild detection
     if [[ "$PKG_FIELD_NAME" =~ ^linux|^kernel ]]; then
         echo ""
         echo -e "  ${YELLOW}[ 🔧 Rebuilding kernel... ]${NC}  Please wait, this may take a moment."
-        # Run post-kernel hook if the distro provides one
-        if [[ -x /usr/lib/arpkg/hooks/post-kernel-install ]]; then
+        [[ -x /usr/lib/arpkg/hooks/post-kernel-install ]] && \
             /usr/lib/arpkg/hooks/post-kernel-install "$PKG_FIELD_NAME" "$PKG_FIELD_VER"
-        fi
         echo ""
     fi
 
-    # ── Extract to root filesystem ──
     if [[ "$verbose" == true ]]; then
         tar -xzvf "$tarball" -C / 2>&1 | grep -v '^\./$' || die "Extraction failed for ${pkg}."
     else
         tar -xzf "$tarball" -C / || die "Extraction failed for ${pkg}."
     fi
 
-    # ── Register in DB ──
     echo "${PKG_FIELD_NAME}|${PKG_FIELD_VER}|${PKG_FIELD_SHA}|$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$PKG_DB"
     log_success "  ${PKG_FIELD_NAME} ${PKG_FIELD_VER} ✓"
 }
 
-# ── cmd: install ─────────────────────────────────────────────────────────────
+# cmd: install
 cmd_install() {
     check_root
     init_dirs
@@ -310,28 +559,66 @@ cmd_install() {
 
     [[ ${#real_pkgs[@]} -gt 0 ]] || die "No packages specified."
 
-    # ── Partition: arpkg-managed vs servant fallback vs not found ─────────────
-    local arpkg_queue=() servant_queue=()
+    # Partition: arpkg index -> servant fallback -> not found
+    local arpkg_queue=()
+    declare -A servant_assignments
 
     for pkg in "${real_pkgs[@]}"; do
         if is_installed "$pkg"; then
             log_warn "${pkg} is already installed ($(get_installed_version "$pkg")). Skipping."
             continue
         fi
+
         if [[ -s "$PKG_INDEX" ]] && lookup_pkg "$pkg" &>/dev/null; then
             arpkg_queue+=("$pkg")
         else
-            local _sv; _sv=$(get_active_servant)
-            if [[ -n "$_sv" ]]; then
-                servant_queue+=("$pkg")
-                log_info "[ 🔀 ] '${pkg}' not in arpkg index — queued for servant (${_sv})."
+            # Query all servants to detect multi-source conflicts
+            local matches=()
+            mapfile -t matches < <(_servant_search_pkg "$pkg" 2>/dev/null || true)
+
+            if [[ ${#matches[@]} -eq 0 ]]; then
+                local _sv; _sv=$(get_active_servant)
+                if [[ -n "$_sv" ]]; then
+                    servant_assignments["$pkg"]="$_sv"
+                    log_info "[ 🔀 ] '${pkg}' queued for servant (${_sv}) — could not verify availability."
+                else
+                    die "No such package: '${pkg}' — not in arpkg index and no servant configured.
+  Contribute it: ${CONTRIBUTING_URL}"
+                fi
+            elif [[ ${#matches[@]} -eq 1 ]]; then
+                local sv_name; sv_name=$(cut -d'|' -f1 <<< "${matches[0]}")
+                local sv_ver;  sv_ver=$(cut  -d'|' -f2 <<< "${matches[0]}")
+                servant_assignments["$pkg"]="$sv_name"
+                log_info "[ 🔀 ] '${pkg}' found via servant ${BOLD}${sv_name}${NC} (${sv_ver})."
             else
-                die "No such package: '${pkg}' — not found in arpkg index and no servant is configured."
+                # Multi-source conflict: ask the user
+                echo ""
+                echo -e "  ${YELLOW}[ ⚡ CONFLICT ]${NC}  '${BOLD}${pkg}${NC}' is available from ${#matches[@]} servants:"
+                echo ""
+                local i=1
+                for m in "${matches[@]}"; do
+                    local m_sv;  m_sv=$(cut  -d'|' -f1 <<< "$m")
+                    local m_ver; m_ver=$(cut -d'|' -f2 <<< "$m")
+                    local m_sz;  m_sz=$(cut  -d'|' -f3 <<< "$m")
+                    local m_sz_fmt; m_sz_fmt=$(_format_size "${m_sz:-0}")
+                    printf "    ${BOLD}[%d]${NC}  %-10s  version %-12s  size %s\n" \
+                        "$i" "$m_sv" "$m_ver" "$m_sz_fmt"
+                    i=$(( i + 1 ))
+                done
+                echo ""
+                local choice
+                read -rp "  Which servant to use? [1-${#matches[@]}] " choice
+                local idx=$(( choice - 1 ))
+                local chosen="${matches[$idx]}"
+                local c_sv; c_sv=$(cut -d'|' -f1 <<< "$chosen")
+                servant_assignments["$pkg"]="$c_sv"
+                log_info "Using servant: ${BOLD}${c_sv}${NC} for '${pkg}'."
+                echo ""
             fi
         fi
     done
 
-    # ── Resolve dependency order for arpkg packages ───────────────────────────
+    # Resolve dependency order for arpkg packages
     local visited=() order=()
     for pkg in "${arpkg_queue[@]}"; do
         if [[ "$no_deps" == true ]]; then
@@ -341,10 +628,12 @@ cmd_install() {
         fi
     done
 
-    [[ ${#order[@]} -eq 0 && ${#servant_queue[@]} -eq 0 ]] \
+    local servant_pkgs=("${!servant_assignments[@]}")
+
+    [[ ${#order[@]} -eq 0 && ${#servant_pkgs[@]} -eq 0 ]] \
         && { log_info "Nothing to install."; return 0; }
 
-    # ── Collect metadata + sizes ──────────────────────────────────────────────
+    # Collect metadata + sizes (arpkg packages)
     declare -A _pver _purl _psha _psz
     local total_bytes=0
 
@@ -356,53 +645,76 @@ cmd_install() {
             _pver["$pkg"]="$PKG_FIELD_VER"
             _purl["$pkg"]="$PKG_FIELD_URL"
             _psha["$pkg"]="$PKG_FIELD_SHA"
-            local sz; sz=$(_get_pkg_size "$PKG_FIELD_URL")
-            _psz["$pkg"]="${sz:-0}"
-            total_bytes=$(( total_bytes + ${sz:-0} ))
+            if [[ -n "$PKG_FIELD_URL" && "$PKG_FIELD_URL" =~ ^https?:// ]]; then
+                local sz; sz=$(_get_pkg_size "$PKG_FIELD_URL")
+                _psz["$pkg"]="${sz:-0}"
+                total_bytes=$(( total_bytes + ${sz:-0} ))
+            else
+                _psz["$pkg"]=0
+            fi
         done
     fi
 
-    # ── Installation table ────────────────────────────────────────────────────
-    local _sep="──────────────────────────┬──────────────────┬────────────"
+    # Installation table
+    local _sep="──────────────────────────┬────────────────────┬────────────"
     echo ""
     echo -e "${BOLD}  ┌${_sep}┐${NC}"
-    printf  "  ${BOLD}│ %-26s│ %-18s│ %-11s│${NC}\n" "Package" "Version" "Size"
+    printf  "  ${BOLD}│ %-26s│ %-20s│ %-11s│${NC}\n" "Package" "Version" "Size"
     echo -e "  ${BOLD}├${_sep}┤${NC}"
+
     for pkg in "${order[@]}"; do
         local sfmt; sfmt=$(_format_size "${_psz[$pkg]:-0}")
-        printf "  │ ${GREEN}%-26s${NC}│ %-18s│ %-11s│\n" \
-            "$pkg" "${_pver[$pkg]}" "$sfmt"
+        local ver="${_pver[$pkg]:-?}"
+        local src_label=""
+        [[ -z "${_psha[$pkg]:-}" ]] && src_label=" (src)"
+        printf "  │ ${GREEN}%-26s${NC}│ %-20s│ %-11s│\n" \
+            "$pkg" "${ver}${src_label}" "$sfmt"
     done
-    for pkg in "${servant_queue[@]}"; do
-        local _sname; _sname=$(get_active_servant)
-        printf "  │ ${YELLOW}%-26s${NC}│ %-18s│ %-11s│\n" \
-            "$pkg" "(servant: ${_sname})" "?"
+
+    for pkg in "${servant_pkgs[@]}"; do
+        local _sname="${servant_assignments[$pkg]}"
+        local sv_ver sv_sz sv_sz_fmt
+        sv_ver=$(_servant_search_pkg "$pkg" 2>/dev/null \
+            | grep "^${_sname}|" | cut -d'|' -f2 | head -1 || echo "?")
+        sv_sz=$(_servant_search_pkg  "$pkg" 2>/dev/null \
+            | grep "^${_sname}|" | cut -d'|' -f3 | head -1 || echo "0")
+        sv_sz_fmt=$(_format_size "${sv_sz:-0}")
+        printf "  │ ${YELLOW}%-26s${NC}│ %-20s│ %-11s│\n" \
+            "$pkg" "${sv_ver:-?} [${_sname}]" "$sv_sz_fmt"
     done
+
     echo -e "  └${_sep}┘"
     local _total_fmt; _total_fmt=$(_format_size "$total_bytes")
-    local _total_count=$(( ${#order[@]} + ${#servant_queue[@]} ))
+    local _total_count=$(( ${#order[@]} + ${#servant_pkgs[@]} ))
     echo ""
-    echo -e "  ${BOLD}${_total_count} package(s)${NC}  •  arpkg: ${#order[@]}  •  servant: ${#servant_queue[@]}  •  download: ${_total_fmt}"
+    echo -e "  ${BOLD}${_total_count} package(s)${NC}  •  arpkg: ${#order[@]}  •  servant: ${#servant_pkgs[@]}  •  download: ${_total_fmt}"
     echo ""
 
-    # ── Confirm ───────────────────────────────────────────────────────────────
+    # Confirm
     if [[ "$auto_yes" != true ]]; then
         read -rp "Proceed with installation? [Y/n] " _conf
         [[ "$_conf" =~ ^[Nn]$ ]] && { log_info "Aborted."; exit 0; }
     fi
     echo ""
 
-    # ── Download phase — single TOTAL progress bar ────────────────────────────
-    if [[ ${#order[@]} -gt 0 ]]; then
-        echo -e "${BOLD}  [ ↓ ] Downloading ${#order[@]} package(s)...${NC}"
+    # Download phase (tarball packages only) — single TOTAL progress bar
+    local tarball_order=()
+    for pkg in "${order[@]}"; do
+        if [[ -n "${_purl[$pkg]:-}" && "${_purl[$pkg]}" =~ ^https?://.+\.tar ]]; then
+            tarball_order+=("$pkg")
+        fi
+    done
+
+    if [[ ${#tarball_order[@]} -gt 0 ]]; then
+        echo -e "${BOLD}  [ ↓ ] Downloading ${#tarball_order[@]} tarball package(s)...${NC}"
         echo ""
         local _dl_done=0 _dl_bytes=0
-        for pkg in "${order[@]}"; do
+        for pkg in "${tarball_order[@]}"; do
             _dl_done=$(( _dl_done + 1 ))
             local _ver="${_pver[$pkg]}" _url="${_purl[$pkg]}"
             local _tb="${PKG_CACHE}/downloads/${pkg}-${_ver}.tar.gz"
             printf "  ${CYAN}[%d/%d]${NC} Fetching ${BOLD}%s${NC} %s ...\n" \
-                "$_dl_done" "${#order[@]}" "$pkg" "$_ver"
+                "$_dl_done" "${#tarball_order[@]}" "$pkg" "$_ver"
             curl -fL --silent --connect-timeout 15 --max-time 300 \
                 -o "$_tb" "$_url" \
                 || die "Download failed for ${pkg}."
@@ -410,30 +722,42 @@ cmd_install() {
             _draw_progress_bar "$_dl_bytes" "$total_bytes"; echo ""
         done
         echo ""
-        log_success "All packages downloaded.  Total: ${_total_fmt}"
+        log_success "Downloads complete.  Total: ${_total_fmt}"
         echo ""
     fi
 
-    # ── Install phase ─────────────────────────────────────────────────────────
+    # Install phase
     if [[ ${#order[@]} -gt 0 ]]; then
-        echo -e "${BOLD}  [ ⚙ ] Installing packages...${NC}"
+        echo -e "${BOLD}  [ ⚙ ] Building / installing packages from source...${NC}"
         echo ""
         for pkg in "${order[@]}"; do
-            _verify_and_extract "$pkg" "$verbose"
+            if [[ -n "${_purl[$pkg]:-}" && "${_purl[$pkg]}" =~ ^https?://.+\.tar ]]; then
+                _verify_and_extract "$pkg" "$verbose"
+            else
+                # Source build via ARKBUILD (per CONTRIBUTING.md)
+                _build_from_arkbuild "$pkg" "$verbose"
+            fi
         done
         echo ""
         log_success "arpkg: ${#order[@]} package(s) installed."
         echo ""
     fi
 
-    # ── Servant phase ─────────────────────────────────────────────────────────
-    if [[ ${#servant_queue[@]} -gt 0 ]]; then
-        local _sv; _sv=$(get_active_servant)
-        _servant_install "$_sv" "${servant_queue[@]}"
+    # Servant phase: group by servant and install together
+    if [[ ${#servant_pkgs[@]} -gt 0 ]]; then
+        declare -A _sv_groups
+        for pkg in "${servant_pkgs[@]}"; do
+            local _sv="${servant_assignments[$pkg]}"
+            _sv_groups["$_sv"]+="${pkg} "
+        done
+        for _sv in "${!_sv_groups[@]}"; do
+            read -ra _pkgs_for_sv <<< "${_sv_groups[$_sv]}"
+            _servant_install "$_sv" "${_pkgs_for_sv[@]}"
+        done
     fi
 }
 
-# _install_single — used by cmd_upgrade (single package, downloads inline)
+# _install_single — used by cmd_upgrade (single package)
 _install_single() {
     local pkg="$1" verbose="$2"
     local entry; entry=$(lookup_pkg "$pkg") || die "Package '${pkg}' not found."
@@ -441,18 +765,19 @@ _install_single() {
 
     log_step "Installing ${BOLD}${PKG_FIELD_NAME}${NC} ${PKG_FIELD_VER}..."
 
-    local tarball="${PKG_CACHE}/downloads/${PKG_FIELD_NAME}-${PKG_FIELD_VER}.tar.gz"
-
-    # ── Download ──
-    log_step "  Downloading..."
-    curl -fL --progress-bar --connect-timeout 15 \
-        -o "$tarball" "$PKG_FIELD_URL" \
-        || die "Download failed for ${pkg}."
-
-    _verify_and_extract "$pkg" "$verbose"
+    if [[ -n "$PKG_FIELD_URL" && "$PKG_FIELD_URL" =~ ^https?://.+\.tar ]]; then
+        local tarball="${PKG_CACHE}/downloads/${PKG_FIELD_NAME}-${PKG_FIELD_VER}.tar.gz"
+        log_step "  Downloading..."
+        curl -fL --progress-bar --connect-timeout 15 \
+            -o "$tarball" "$PKG_FIELD_URL" \
+            || die "Download failed for ${pkg}."
+        _verify_and_extract "$pkg" "$verbose"
+    else
+        _build_from_arkbuild "$pkg" "$verbose"
+    fi
 }
 
-# ── cmd: remove ──────────────────────────────────────────────────────────────
+# cmd: remove
 cmd_remove() {
     check_root
     local auto_yes=false real_pkgs=()
@@ -477,7 +802,6 @@ cmd_remove() {
             [[ "$confirm" =~ ^[Yy]$ ]] || { log_info "Skipped."; continue; }
         fi
 
-        # Remove files via tarball manifest
         local ver; ver=$(get_installed_version "$pkg")
         local tarball="${PKG_CACHE}/downloads/${pkg}-${ver}.tar.gz"
 
@@ -495,7 +819,7 @@ cmd_remove() {
     done
 }
 
-# ── cmd: upgrade ─────────────────────────────────────────────────────────────
+# cmd: upgrade
 cmd_upgrade() {
     check_root
     [[ -s "$PKG_DB" ]] || { log_info "No packages installed."; return 0; }
@@ -533,7 +857,7 @@ cmd_upgrade() {
     log_success "Upgrade complete."
 }
 
-# ── cmd: search ──────────────────────────────────────────────────────────────
+# cmd: search
 cmd_search() {
     local query="${1:-}"
     [[ -n "$query" ]] || die "Usage: arpkg search <query>"
@@ -558,7 +882,7 @@ cmd_search() {
     echo ""
 }
 
-# ── cmd: info ────────────────────────────────────────────────────────────────
+# cmd: info
 cmd_info() {
     local pkg="${1:-}"; [[ -n "$pkg" ]] || die "Usage: arpkg info <package>"
     local entry; entry=$(lookup_pkg "$pkg") || die "Package '${pkg}' not found."
@@ -573,9 +897,12 @@ cmd_info() {
     echo -e "  ${BOLD}Description:${NC}  ${PKG_FIELD_DESC}"
     echo -e "  ${BOLD}Version:${NC}      ${PKG_FIELD_VER}"
     echo -e "  ${BOLD}Dependencies:${NC} ${PKG_FIELD_DEPS:-none}"
-    echo -e "  ${BOLD}SHA-256:${NC}      ${PKG_FIELD_SHA}"
+    if [[ -n "$PKG_FIELD_SHA" ]]; then
+        echo -e "  ${BOLD}SHA-256:${NC}      ${PKG_FIELD_SHA}"
+    else
+        echo -e "  ${BOLD}Build:${NC}        source (git clone + ARKBUILD compile)"
+    fi
     echo -e "  ${BOLD}Source:${NC}       ${PKG_FIELD_URL}"
-
     if is_installed "$pkg"; then
         echo -e "  ${BOLD}Status:${NC}       ${GREEN}● Installed${NC} ($(get_installed_version "$pkg"))"
     else
@@ -584,7 +911,7 @@ cmd_info() {
     echo ""
 }
 
-# ── cmd: list ────────────────────────────────────────────────────────────────
+# cmd: list
 cmd_list() {
     [[ -s "$PKG_DB" ]] || { log_info "No packages installed."; return 0; }
     echo ""
@@ -612,12 +939,18 @@ cmd_list_all() {
     echo ""
 }
 
-# ── cmd: verify ──────────────────────────────────────────────────────────────
+# cmd: verify
 cmd_verify() {
     local pkg="${1:-}"; [[ -n "$pkg" ]] || die "Usage: arpkg verify <package>"
     is_installed "$pkg" || die "${pkg} is not installed."
 
     local stored_sha; stored_sha=$(grep "^${pkg}|" "$PKG_DB" | cut -d'|' -f3)
+
+    if [[ "$stored_sha" == "source-build" || -z "$stored_sha" ]]; then
+        log_info "${pkg} was built from source — no tarball checksum to verify."
+        return 0
+    fi
+
     local ver; ver=$(get_installed_version "$pkg")
     local tarball="${PKG_CACHE}/downloads/${pkg}-${ver}.tar.gz"
 
@@ -635,7 +968,7 @@ cmd_verify() {
     fi
 }
 
-# ── cmd: deps (tree) ─────────────────────────────────────────────────────────
+# cmd: deps (tree)
 cmd_deps() {
     local pkg="${1:-}"; [[ -n "$pkg" ]] || die "Usage: arpkg deps <package>"
     lookup_pkg "$pkg" >/dev/null || die "Package '${pkg}' not found."
@@ -670,14 +1003,15 @@ _deps_tree() {
     done
 }
 
-# ── cmd: clean ───────────────────────────────────────────────────────────────
+# cmd: clean
 cmd_clean() {
     log_step "Clearing download cache..."
-    rm -rf "${PKG_CACHE}/downloads/"* "${PKG_CACHE}/extracted/"*
+    rm -rf "${PKG_CACHE}/downloads/"* "${PKG_CACHE}/extracted/"* \
+           "${PKG_CACHE}/build/"*
     log_success "Cache cleared."
 }
 
-# ── cmd: yay (Arch Subsystem bridge) ─────────────────────────────────────────
+# cmd: yay (Arch Subsystem bridge)
 cmd_yay() {
     local bridge="/usr/lib/arpkg/arch-subsystem/yay-bridge"
     [[ -x "$bridge" ]] \
@@ -685,7 +1019,7 @@ cmd_yay() {
     exec "$bridge" "$@"
 }
 
-# ── OS Detection ─────────────────────────────────────────────────────────────
+# OS Detection
 _os_id()   { grep "^ID="      /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "unknown"; }
 _os_like() { grep "^ID_LIKE=" /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo ""; }
 
@@ -699,59 +1033,107 @@ is_arch_based() {
     [[ "$id" == "arch" || "$like" == *"arch"* ]]
 }
 
-# ── Servant config helpers ────────────────────────────────────────────────────
+is_rpm_based() {
+    local id; id=$(_os_id); local like; like=$(_os_like)
+    [[ "$id" == "fedora" || "$id" == "rhel" || "$id" == "centos" || "$id" == "opensuse" \
+       || "$like" == *"rhel"* || "$like" == *"fedora"* || "$like" == *"suse"* ]]
+}
+
+# Servant config helpers
+# servant.conf format: one "servant=<name>" line per registered servant
 get_active_servant() {
     [[ -f "$SERVANT_CONF" ]] \
-        && grep "^servant=" "$SERVANT_CONF" | cut -d= -f2 | tr -d '"' \
+        && grep "^servant=" "$SERVANT_CONF" | head -1 | cut -d= -f2 | tr -d '"' \
         || echo ""
+}
+
+get_all_servants() {
+    [[ -f "$SERVANT_CONF" ]] \
+        && grep "^servant=" "$SERVANT_CONF" | cut -d= -f2 | tr -d '"' \
+        || true
 }
 
 _save_servant() {
     mkdir -p /etc/arpkg
-    echo "servant=${1}" > "$SERVANT_CONF"
+    local name="$1"
+    if [[ -f "$SERVANT_CONF" ]] && grep -q "^servant=${name}$" "$SERVANT_CONF"; then
+        log_warn "Servant '${name}' is already registered."
+        return 0
+    fi
+    echo "servant=${name}" >> "$SERVANT_CONF"
 }
 
-# ── cmd: --servant add <name> ─────────────────────────────────────────────────
+# cmd: --servant add <name>
 cmd_servant() {
     local sub="${1:-}"; shift || true
     case "$sub" in
-        add) _servant_add "$@" ;;
-        *)   die "Unknown --servant subcommand: '${sub}'. Usage: arpkg --servant add <name>" ;;
+        add)  _servant_add "$@" ;;
+        list) _servant_list     ;;
+        *)    die "Unknown --servant subcommand: '${sub}'. Usage: arpkg --servant add <name>" ;;
     esac
+}
+
+_servant_list() {
+    local servants=()
+    mapfile -t servants < <(get_all_servants)
+    if [[ ${#servants[@]} -eq 0 ]]; then
+        log_info "No servants registered. Use 'arpkg --servant add <name>'."; return 0
+    fi
+    echo ""
+    echo -e "${BOLD}Registered servants:${NC}"
+    for sv in "${servants[@]}"; do
+        local avail="${RED}✗ not found${NC}"
+        local bin="$sv"
+        [[ "$sv" == "apt" && -x "$SHADOW_APT" ]] && bin="$SHADOW_APT"
+        command -v "$bin" &>/dev/null && avail="${GREEN}✓ available${NC}"
+        printf "  ${BOLD}%-10s${NC}  %b\n" "$sv" "$avail"
+    done
+    echo ""
 }
 
 _servant_add() {
     check_root
     local name="${1:-}"
-    [[ -n "$name" ]] || die "Usage: arpkg --servant add <name>  (e.g. apt, pacman, yay)"
+    [[ -n "$name" ]] || die "Usage: arpkg --servant add <name>  (e.g. apt, pacman, flatpak, snapd)"
 
     local -a debian_servants=("apt")
     local -a arch_servants=("pacman" "yay" "paru")
+    local -a rpm_servants=("dnf" "zypper")
+    local -a universal_servants=("flatpak" "snapd" "snap")
 
-    # ── OS compatibility gate ──
     if printf '%s\n' "${debian_servants[@]}" | grep -qx "$name"; then
         is_debian_based \
-            || die "[ ✗ ] Servant '${name}' is only available on Debian-based systems. Current OS: $(_os_id)"
+            || die "Servant '${name}' is only available on Debian-based systems. Current OS: $(_os_id)"
     elif printf '%s\n' "${arch_servants[@]}" | grep -qx "$name"; then
         is_arch_based \
-            || die "[ ✗ ] Servant '${name}' is only available on Arch-based systems. Current OS: $(_os_id)"
+            || die "Servant '${name}' is only available on Arch-based systems. Current OS: $(_os_id)"
+    elif printf '%s\n' "${rpm_servants[@]}" | grep -qx "$name"; then
+        is_rpm_based \
+            || die "Servant '${name}' is only available on RPM-based systems. Current OS: $(_os_id)"
+    elif printf '%s\n' "${universal_servants[@]}" | grep -qx "$name"; then
+        : # flatpak / snapd / snap: universal, no OS restriction
     else
         log_warn "Unrecognised servant '${name}'. Registering anyway — no OS guard applied."
     fi
 
-    # ── Binary presence check (shadow realm aware) ──
-    if [[ "$name" == "apt" ]] && [[ -x "$SHADOW_APT" ]]; then
+    # Binary presence check (shadow realm aware for apt on Konix)
+    if [[ "$name" == "apt" && -x "$SHADOW_APT" ]]; then
         log_info "Found apt via shadow realm path (Konix mode)."
+    elif [[ "$name" == "snapd" ]]; then
+        command -v snap &>/dev/null \
+            || log_warn "'snap' not in PATH. Install snapd first."
     elif ! command -v "$name" &>/dev/null; then
         log_warn "'${name}' not found in PATH. Make sure it is installed before using it."
     fi
 
     _save_servant "$name"
-    log_success "Servant '${name}' registered and active."
-    log_info   "arpkg will delegate supported operations to '${name}'."
+    log_success "Servant '${name}' registered."
+    log_info    "arpkg will now search all servants when a package is not in the arpkg index."
+    echo ""
+    log_info    "Contributing packages to arpkg: ${CONTRIBUTING_URL}"
 }
 
-# ── cmd: --add --confirm <repo_url> ──────────────────────────────────────────
+# cmd: --add --confirm <repo_url>
 cmd_add_repo() {
     local confirmed=false repo_url=""
 
@@ -762,7 +1144,6 @@ cmd_add_repo() {
         esac
     done
 
-    # ── Vibe check gate ──
     if [[ "$confirmed" != true ]]; then
         echo -e "${RED}[ 🛑 VIBE CHECK FAILED ]${NC} Bro, this repo is unverified."
         echo -e "  Use ${BOLD}--confirm${NC} to acknowledge you might brick your OS."
@@ -784,14 +1165,35 @@ cmd_add_repo() {
             log_info "Adding repo to ${dest}..."
             echo "deb ${repo_url}" >> "$dest"
             log_success "Repo appended to ${dest}."
-            log_info   "Run your apt update to sync the new repo."
+            log_info    "Run 'arpkg update' to sync."
             ;;
         pacman|yay|paru)
             local dest="/etc/pacman.conf"
             log_info "Appending custom repo section to ${dest}..."
             printf '\n[arpkg-custom]\nServer = %s\n' "$repo_url" >> "$dest"
             log_success "Repo appended to ${dest}."
-            log_info   "Run 'pacman -Sy' to sync."
+            log_info    "Run 'arpkg update' to sync."
+            ;;
+        flatpak)
+            local remote_name; remote_name=$(basename "$repo_url" .flatpakrepo)
+            flatpak remote-add --if-not-exists "$remote_name" "$repo_url" \
+                || die "flatpak remote-add failed."
+            log_success "Flatpak remote '${remote_name}' added."
+            ;;
+        snapd|snap)
+            log_warn "snapd does not support custom repos in the traditional sense."
+            log_info  "Use 'snap install --channel=...' for side-loading custom snaps."
+            ;;
+        dnf)
+            local dest="/etc/yum.repos.d/arpkg-custom.repo"
+            printf '[arpkg-custom]\nbaseurl=%s\nenabled=1\ngpgcheck=0\n' \
+                "$repo_url" >> "$dest"
+            log_success "DNF repo added at ${dest}."
+            ;;
+        zypper)
+            zypper addrepo "$repo_url" "arpkg-custom" \
+                || die "zypper addrepo failed."
+            log_success "Zypper repo added."
             ;;
         *)
             die "Don't know how to add repos for servant '${servant}'."
@@ -799,28 +1201,114 @@ cmd_add_repo() {
     esac
 }
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# cmd: self-update
+cmd_self_update() {
+    check_root
+
+    local api_url="https://api.github.com/repos/${ARPKG_GITHUB_REPO}/releases"
+
+    local current_tag=0
+    if [[ -f "$SELF_RELEASE_FILE" ]]; then
+        current_tag=$(tr -d '[:space:]' < "$SELF_RELEASE_FILE")
+        [[ "$current_tag" =~ ^[0-9]+$ ]] || current_tag=0
+    fi
+
+    echo ""
+    echo -e "${BOLD}  ┌──────────────────────────────────────────────┐${NC}"
+    echo -e "  ${BOLD}│${NC}  🔄 arpkg self-update                         ${BOLD}│${NC}"
+    echo -e "${BOLD}  └──────────────────────────────────────────────┘${NC}"
+    echo ""
+    log_info "Installed release tag : ${BOLD}${current_tag}${NC}"
+    log_step "Querying GitHub releases..."
+
+    local releases_json
+    releases_json=$(curl -fsSL \
+        --connect-timeout 10 --max-time 30 \
+        -H "Accept: application/vnd.github+json" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        "$api_url" 2>/dev/null) \
+        || die "Failed to reach GitHub API. Check your internet connection."
+
+    # Find the highest numeric tag (1, 2, 3, 4, ...)
+    local latest_tag
+    latest_tag=$(printf '%s' "$releases_json" \
+        | grep '"tag_name"' \
+        | grep -oE '"[0-9]+"' \
+        | tr -d '"' \
+        | sort -n \
+        | tail -1)
+
+    if [[ -z "$latest_tag" || ! "$latest_tag" =~ ^[0-9]+$ ]]; then
+        die "No numeric release tags found on GitHub (repo: ${ARPKG_GITHUB_REPO})."
+    fi
+
+    log_info "Latest release tag    : ${BOLD}${GREEN}${latest_tag}${NC}"
+    echo ""
+
+    if [[ "$latest_tag" -le "$current_tag" ]]; then
+        log_success "arpkg is already up to date (release tag: ${current_tag})."
+        return 0
+    fi
+
+    echo -e "  ${BOLD}Update available:${NC}  ${YELLOW}${current_tag}${NC} → ${GREEN}${latest_tag}${NC}"
+    echo ""
+
+    local self_path
+    self_path=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null \
+                || command -v arpkg 2>/dev/null || echo "$0")
+
+    local download_url="https://github.com/${ARPKG_GITHUB_REPO}/releases/download/${latest_tag}/arpkg"
+    local tmp_path="${self_path}.upd.$$"
+
+    log_step "Downloading arpkg release ${latest_tag}..."
+    echo -e "  ${CYAN}Source:${NC} ${download_url}"
+    echo ""
+
+    curl -fL --progress-bar --connect-timeout 15 --max-time 120 \
+        -o "$tmp_path" "$download_url" \
+        || { rm -f "$tmp_path"; die "Download failed. URL: ${download_url}"; }
+
+    if ! head -1 "$tmp_path" 2>/dev/null | grep -q '^#!'; then
+        rm -f "$tmp_path"
+        die "Downloaded file does not look like a valid script (missing shebang). Aborting."
+    fi
+
+    chmod +x "$tmp_path"
+    mv "$tmp_path" "$self_path" \
+        || { rm -f "$tmp_path"; die "Could not replace ${self_path} — check permissions."; }
+
+    mkdir -p /var/lib/arpkg
+    echo "$latest_tag" > "$SELF_RELEASE_FILE"
+
+    echo ""
+    log_success "arpkg updated  ${current_tag} → ${latest_tag}  at ${self_path}"
+    log_info    "Re-run arpkg to use the new version."
+    echo ""
+}
+
+# Entry point
 main() {
     [[ $# -eq 0 ]] && { usage; exit 0; }
     local cmd="$1"; shift
 
     case "$cmd" in
-        install)    cmd_install  "$@"  ;;
-        remove)     cmd_remove   "$@"  ;;
-        update)     cmd_update         ;;
-        upgrade)    cmd_upgrade        ;;
-        search)     cmd_search   "$@"  ;;
-        info)       cmd_info     "$@"  ;;
-        list)       cmd_list           ;;
-        list-all)   cmd_list_all       ;;
-        deps)       cmd_deps     "$@"  ;;
-        verify)     cmd_verify   "$@"  ;;
-        clean)      cmd_clean          ;;
-        yay)        cmd_yay      "$@"  ;;
-        --servant)  cmd_servant  "$@"  ;;
-        --add)      cmd_add_repo "$@"  ;;
-        --version)  echo "arpkg ${ARPKG_VERSION}"; exit 0 ;;
-        -h|--help)  usage; exit 0     ;;
+        install)     cmd_install    "$@"  ;;
+        remove)      cmd_remove     "$@"  ;;
+        update)      cmd_update           ;;
+        upgrade)     cmd_upgrade          ;;
+        search)      cmd_search     "$@"  ;;
+        info)        cmd_info       "$@"  ;;
+        list)        cmd_list             ;;
+        list-all)    cmd_list_all         ;;
+        deps)        cmd_deps       "$@"  ;;
+        verify)      cmd_verify     "$@"  ;;
+        clean)       cmd_clean            ;;
+        yay)         cmd_yay        "$@"  ;;
+        self-update) cmd_self_update      ;;
+        --servant)   cmd_servant    "$@"  ;;
+        --add)       cmd_add_repo   "$@"  ;;
+        --version)   echo "arpkg ${ARPKG_VERSION}"; exit 0 ;;
+        -h|--help)   usage; exit 0        ;;
         *)  log_error "Unknown command: ${cmd}"; usage; exit 1 ;;
     esac
 }
