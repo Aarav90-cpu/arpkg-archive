@@ -7,7 +7,7 @@ This is the official package repository for **arpkg**, a package manager.
 **DO NOT submit `.tar.gz` files or pre-compiled binaries.** To maintain a zero-trust, zero-bloat ecosystem, ARK OS compiles all packages from source on our secure CI/CD servers. Any Pull Request containing a pre-compiled binary will be immediately closed.
 
 ## Requirements for Submission
-To submit a package to ARK OS, you must create a directory with your package name and include a single configuration file called `ARKBUILD`.
+To submit a package to arpkg, you must create a directory with your package name and include a single configuration file called `ARKBUILD`.
 
 > Note: Make sure the `ARKBUILD` does not contain wget commands! Use curl instead!
 
