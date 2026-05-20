@@ -1,0 +1,22 @@
+# ARKBUILD — lightbase
+# Lightweight API & Database Desktop Client with C99 engine + Python bridge
+PKG_NAME="lightbase"
+PKG_VERSION="1.0.0"
+SOURCE_URL="https://github.com/Aarav90-cpu/LightBase.git"
+DEPENDENCIES="openssl"
+
+build() {
+    git clone --depth 1 --branch v${PKG_VERSION} ${SOURCE_URL} lightbase
+    cd lightbase
+
+    # Build the C99 core engine (libcore.so)
+    make build
+
+    # Install Python runtime dependencies into the source tree
+    pip3 install --quiet --target=./bridge/vendor \
+        -r requirements.txt 2>/dev/null || \
+        pip3 install --quiet -r requirements.txt
+
+    # Install to PKG_ROOT for arpkg staging
+    make install DESTDIR="${PKG_ROOT}"
+}

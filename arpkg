@@ -171,19 +171,23 @@ cmd_update() {
         [[ -f "$arkbuild_path" ]] || continue
 
         local pkg_name="" pkg_ver="" src_url="" deps="" desc=""
-        pkg_name=$(grep -m1 '^PKG_NAME='    "$arkbuild_path" | cut -d= -f2- | tr -d '"' || true)
-        pkg_ver=$(grep  -m1 '^PKG_VERSION=' "$arkbuild_path" | cut -d= -f2- | tr -d '"' || true)
-        src_url=$(grep  -m1 '^SOURCE_URL='  "$arkbuild_path" | cut -d= -f2- | tr -d '"' || true)
-        deps=$(grep     -m1 '^DEPENDENCIES=' "$arkbuild_path" | cut -d= -f2- | tr -d '"' || true)
+        pkg_name=$(grep -m1 '^PKG_NAME='     "$arkbuild_path" | cut -d= -f2- | tr -d '"' || true)
+        pkg_ver=$(grep  -m1 '^PKG_VERSION='  "$arkbuild_path" | cut -d= -f2- | tr -d '"' || true)
+        src_url=$(grep  -m1 '^SOURCE_URL='   "$arkbuild_path" | cut -d= -f2- | tr -d '"' || true)
+        # BUG-FIX: DEPENDENCIES in ARKBUILD are space-separated; index expects commas
+        local raw_deps
+        raw_deps=$(grep -m1 '^DEPENDENCIES=' "$arkbuild_path" | cut -d= -f2- | tr -d '"' || true)
+        deps=$(echo "$raw_deps" | tr ' ' ',' | sed 's/,*$//' | sed 's/^,*//')
 
+        # BUG-FIX: pkginfo.json uses "pkg_name" not "description" as the display field
         local pkginfo_path
         pkginfo_path="$(dirname "$arkbuild_path")/pkginfo.json"
         if [[ -f "$pkginfo_path" ]] && command -v python3 &>/dev/null; then
             desc=$(python3 -c \
-                "import json; d=json.load(open('${pkginfo_path}')); print(d.get('description',''))" \
+                "import json; d=json.load(open('${pkginfo_path}')); print(d.get('description', d.get('pkg_name','')))" \
                 2>/dev/null || true)
         fi
-        [[ -z "$desc" ]] && desc="$(basename "$(dirname "$arkbuild_path")")"
+        [[ -z "$desc" ]] && desc="${pkg_name:-$(basename "$(dirname "$arkbuild_path")")}"
 
         [[ -z "$pkg_name" ]] && continue
         [[ -z "$pkg_ver"  ]] && pkg_ver="unknown"
@@ -403,7 +407,11 @@ _servant_install() {
         pacman)      pacman -S --noconfirm "${pkgs[@]}"        || exit_code=$? ;;
         yay|paru)    "$servant" -S --noconfirm "${pkgs[@]}"    || exit_code=$? ;;
         flatpak)     flatpak install --assumeyes "${pkgs[@]}"  || exit_code=$? ;;
-        snapd|snap)  snap install "${pkgs[@]}"                 || exit_code=$? ;;
+        snapd|snap)
+            # BUG-FIX: snap does not accept multiple packages in one call
+            for _snap_pkg in "${pkgs[@]}"; do
+                snap install "$_snap_pkg" || exit_code=$?
+            done ;;
         dnf)         dnf install -y "${pkgs[@]}"               || exit_code=$? ;;
         zypper)      zypper install -y "${pkgs[@]}"            || exit_code=$? ;;
         *)           "$servant" install "${pkgs[@]}"           || exit_code=$? ;;
@@ -418,90 +426,80 @@ _servant_install() {
     return $exit_code
 }
 
-# ARKBUILD-based source build
-# Clones the package source repo and builds it from scratch per CONTRIBUTING.md
+# ARKBUILD-based source build — sources the full ARKBUILD and calls build() or compile()
 _build_from_arkbuild() {
     local pkg="$1" verbose="$2"
     local entry; entry=$(lookup_pkg "$pkg") || die "Package '${pkg}' not found."
     parse_index_line "$entry"
 
-    local arkbuild_path="${ARCHIVE_CLONE_DIR}/core/${pkg}/ARKBUILD"
+    # BUG-FIX: correct path is ARK-Packages/{core,community}
+    local arkbuild_path="${ARCHIVE_CLONE_DIR}/ARK-Packages/core/${pkg}/ARKBUILD"
     [[ -f "$arkbuild_path" ]] || \
-        arkbuild_path="${ARCHIVE_CLONE_DIR}/community/${pkg}/ARKBUILD"
+        arkbuild_path="${ARCHIVE_CLONE_DIR}/ARK-Packages/community/${pkg}/ARKBUILD"
     [[ -f "$arkbuild_path" ]] || \
         die "ARKBUILD not found for '${pkg}'. Run 'arpkg update' first."
 
-    local build_src_url="" build_pkg_ver=""
-    build_src_url=$(grep -m1 '^SOURCE_URL='  "$arkbuild_path" | cut -d= -f2- | tr -d '"' || true)
-    build_pkg_ver=$(grep -m1 '^PKG_VERSION=' "$arkbuild_path" | cut -d= -f2- | tr -d '"' || true)
-
-    [[ -n "$build_src_url" ]] || die "No SOURCE_URL in ARKBUILD for '${pkg}'."
+    # Read metadata directly from the ARKBUILD so it is always accurate
+    local build_pkg_ver; build_pkg_ver=$(grep -m1 '^PKG_VERSION=' "$arkbuild_path" \
+        | cut -d= -f2- | tr -d '"' || true)
+    local build_src_url; build_src_url=$(grep -m1 '^SOURCE_URL='  "$arkbuild_path" \
+        | cut -d= -f2- | tr -d '"' || true)
     [[ -n "$build_pkg_ver" ]] || build_pkg_ver="$PKG_FIELD_VER"
 
     command -v git &>/dev/null || die "git is required to build '${pkg}' from source."
 
     local build_dir="/var/cache/arpkg/build/${pkg}"
+    local pkg_root="${build_dir}/pkg_root"
     rm -rf "$build_dir"
-    mkdir -p "$build_dir"
+    mkdir -p "$pkg_root"
 
     echo ""
     echo -e "  ${MAGENTA}[ ✨ Vibe-checking dependencies... ]${NC}"
-    log_build "  Cloning source for ${BOLD}${pkg}${NC} ${build_pkg_ver}..."
-    echo -e "  ${CYAN}Source:${NC} ${build_src_url}"
+    log_build "  Preparing build for ${BOLD}${pkg}${NC} ${build_pkg_ver}..."
+    [[ -n "$build_src_url" ]] && echo -e "  ${CYAN}Source:${NC} ${build_src_url}"
     echo ""
-
-    # Try versioned tag first (v$VER), then bare tag, then HEAD
-    if git clone --depth 1 --branch "v${build_pkg_ver}" \
-            "$build_src_url" "${build_dir}/src" 2>/dev/null; then
-        log_success "  Cloned at tag v${build_pkg_ver}."
-    elif git clone --depth 1 --branch "${build_pkg_ver}" \
-            "$build_src_url" "${build_dir}/src" 2>/dev/null; then
-        log_success "  Cloned at tag ${build_pkg_ver}."
-    else
-        log_warn "  No version tag found — cloning HEAD."
-        git clone --depth 1 "$build_src_url" "${build_dir}/src" \
-            || die "git clone failed for ${pkg} (${build_src_url})."
-    fi
 
     # Kernel rebuild detection
     if [[ "$pkg" =~ ^linux|^kernel ]]; then
-        echo ""
         echo -e "  ${YELLOW}[ 🔧 Rebuilding kernel... ]${NC}  Please wait, this may take a moment."
         [[ -x /usr/lib/arpkg/hooks/post-kernel-install ]] && \
             /usr/lib/arpkg/hooks/post-kernel-install "$pkg" "$build_pkg_ver"
         echo ""
     fi
 
-    # Run compile() from ARKBUILD
-    local pkg_root="${build_dir}/pkg_root"
-    mkdir -p "$pkg_root"
-
     log_build "  Building ${BOLD}${pkg}${NC}..."
     echo ""
 
+    # BUG-FIX: source the entire ARKBUILD (not just 50 lines of compile()).
+    # BUG-FIX: call build() which is the real function name in all ARKBUILDs;
+    #          fall back to fetch()+compile() for the CONTRIBUTING.md template style.
     (
         set -euo pipefail
-        PKG_ROOT="$pkg_root"
-        export PKG_ROOT
-        cd "${build_dir}/src"
-        # Source only the compile() function from ARKBUILD
-        _compile_src=$(grep -A 50 '^compile()' "$arkbuild_path" 2>/dev/null | head -50 || true)
-        eval "$_compile_src"
-        if declare -f compile &>/dev/null; then
+        export PKG_ROOT="$pkg_root"
+        export PKG_VERSION="$build_pkg_ver"
+        cd "$build_dir"
+
+        # Source ARKBUILD — only defines vars and functions, no side effects
+        # shellcheck source=/dev/null
+        source "$arkbuild_path"
+
+        if declare -f build &>/dev/null; then
             if [[ "$verbose" == true ]]; then
-                compile
+                build
             else
-                compile 2>&1 | tail -5 | sed 's/^/    /'
+                build 2>&1 | tail -8 | sed '"'"'s/^/    /'"'"'
             fi
+        elif declare -f fetch &>/dev/null || declare -f compile &>/dev/null; then
+            declare -f fetch    &>/dev/null && { [[ "$verbose" == true ]] && fetch    || fetch    2>&1 | tail -5 | sed '"'"'s/^/    /'"'"'; }
+            declare -f compile  &>/dev/null && { [[ "$verbose" == true ]] && compile  || compile  2>&1 | tail -8 | sed '"'"'s/^/    /'"'"'; }
         else
-            log_warn "No compile() function found in ARKBUILD — raw source clone only."
+            echo "WARNING: No build(), fetch(), or compile() found in ARKBUILD for ${pkg}." >&2
         fi
     ) || die "Build failed for '${pkg}'. Run with -v for full output."
 
     log_success "  Build complete."
     echo ""
 
-    # Install pkg_root contents to /
     echo -e "  ${CYAN}[ ⚙ ]${NC} Installing (${BOLD}${pkg}${NC} ${build_pkg_ver})..."
     if [[ -d "$pkg_root" && "$(ls -A "$pkg_root" 2>/dev/null)" ]]; then
         cp -a "${pkg_root}/." /
@@ -509,7 +507,6 @@ _build_from_arkbuild() {
         log_warn "  pkg_root is empty — package may install via its own Makefile."
     fi
 
-    # Register in DB (sha256 not applicable for source builds)
     echo "${pkg}|${build_pkg_ver}|source-build|$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$PKG_DB"
     log_success "  ${pkg} ${build_pkg_ver} ✓  (built from source)"
 }
@@ -687,11 +684,11 @@ cmd_install() {
 
     for pkg in "${servant_pkgs[@]}"; do
         local _sname="${servant_assignments[$pkg]}"
+        # BUG-FIX: cache result so _servant_search_pkg is only called once per package
+        local _sv_info; _sv_info=$(_servant_search_pkg "$pkg" 2>/dev/null             | grep "^${_sname}|" | head -1 || true)
         local sv_ver sv_sz sv_sz_fmt
-        sv_ver=$(_servant_search_pkg "$pkg" 2>/dev/null \
-            | grep "^${_sname}|" | cut -d'|' -f2 | head -1 || echo "?")
-        sv_sz=$(_servant_search_pkg  "$pkg" 2>/dev/null \
-            | grep "^${_sname}|" | cut -d'|' -f3 | head -1 || echo "0")
+        sv_ver=$(cut -d'|' -f2 <<< "${_sv_info:-?||}" || echo "?")
+        sv_sz=$(cut  -d'|' -f3 <<< "${_sv_info:-?|0|}" || echo "0")
         sv_sz_fmt=$(_format_size "${sv_sz:-0}")
         printf "  │ ${YELLOW}%-26s${NC}│ %-20s│ %-11s│\n" \
             "$pkg" "${sv_ver:-?} [${_sname}]" "$sv_sz_fmt"
