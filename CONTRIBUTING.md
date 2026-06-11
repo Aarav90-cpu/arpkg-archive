@@ -1,8 +1,7 @@
 # How to Contribute to arpkg
 
 ## What is this?
-This is the official package repository for **arpkg**, the native package manager for ARK OS. 
-*(Note: This project is currently in Alpha. ARK OS is not yet released for general production.)*
+This is the official package repository for **arpkg**.
 
 ## The Golden Rule: No Binaries
 **DO NOT submit `.tar.gz` files or pre-compiled binaries.** To maintain a zero-trust, zero-bloat ecosystem, ARK OS compiles all packages from source on our secure CI/CD servers. Any Pull Request containing a pre-compiled binary will be immediately closed.
